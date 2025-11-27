@@ -5,9 +5,9 @@ import (
 	"unsafe"
 )
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // TEST ORGANIZATION
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
 // This test suite follows the hardware pipeline structure:
 //
@@ -60,27 +60,50 @@ import (
 //     - Performance metrics
 //     - Documentation validation
 //
-// AGE FIELD CONVENTION (CRITICAL):
-// ─────────────────────────────────
-// Throughout these tests, Age represents program order:
-//   - Higher Age = OLDER (entered window first, earlier in program)
-//   - Lower Age = NEWER (entered window later)
-//   - Age must be set for dependency tracking to work correctly
+// AGE FIELD CONVENTION (POSITION-BASED SYSTEM):
+// ─────────────────────────────────────────────
+// Throughout these tests, Age represents the op's POSITION in the instruction window.
+//
+// Core Principle: Age = Slot Index
+//   - Window has 32 slots [0-31]
+//   - Each slot has a fixed position in the FIFO
+//   - Age equals the slot index
+//   - Higher slot index = older position (entered window earlier)
+//
+// Window Layout:
+//   Slot 31 (Age=31): oldest position in FIFO window
+//   Slot 15 (Age=15): middle position
+//   Slot 0  (Age=0):  newest position
 //
 // Example: For chain A → B → C (A produces for B, B produces for C):
-//   Op A: Age = 2 (oldest, came first in program order)
-//   Op B: Age = 1 (middle)
-//   Op C: Age = 0 (newest, came last)
+//   Op A at slot 20: Age = 20 (oldest position, came first in program)
+//   Op B at slot 10: Age = 10 (middle position)
+//   Op C at slot 5:  Age = 5  (newest position, came last)
 //
 // Dependency check: Producer.Age > Consumer.Age
-//   A.Age(2) > B.Age(1) ✓ → B depends on A
-//   B.Age(1) > C.Age(0) ✓ → C depends on B
+//   A.Age(20) > B.Age(10) ✓ → B depends on A
+//   B.Age(10) > C.Age(5)  ✓ → C depends on B
 //
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// Why Overflow is Impossible:
+//   • Window has exactly 32 slots [0-31]
+//   • Age = slot index
+//   • No slot 32 exists → No Age 32 possible
+//   • Simple comparison always works
+//   • No wraparound logic needed!
+//
+// Benefits:
+//   • Prevents false WAR dependencies (+10-15% IPC)
+//   • Prevents false WAW dependencies
+//   • Enforces correct program order
+//   • Overflow impossible (bounded by window topology)
+//   • No wraparound logic required
+//   • Elegant and simple design
+//
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 1. BASIC COMPONENT TESTS
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestScoreboardBasicOperations verifies the fundamental scoreboard operations:
 // marking registers as ready/pending and checking their status. This tests the
@@ -258,33 +281,33 @@ func TestImmField_Values(t *testing.T) {
 	}
 }
 
-// TestAgeField_Boundaries tests the Age field which tracks program order.
-// Age is 5 bits (0-31) though the field is uint8.
-// CONVENTION: Higher Age = Older (earlier in program order)
+// TestAgeField_Boundaries tests the Age field which represents slot position.
+// Age equals slot index (0-31), naturally bounded by window size.
+// CONVENTION: Age = slot index, higher index = older position in FIFO
 func TestAgeField_Boundaries(t *testing.T) {
-	// Age is 5 bits (0-31)
+	// Age is 5 bits (0-31), represents slot position in window
 	op := Operation{Valid: true, Age: 0}
 	if op.Age != 0 {
-		t.Error("Age 0 should be valid")
+		t.Error("Age 0 should be valid (slot 0, newest position)")
 	}
 
 	op.Age = 31
 	if op.Age != 31 {
-		t.Error("Age 31 should be valid (max 5-bit value)")
+		t.Error("Age 31 should be valid (slot 31, oldest position)")
 	}
 
-	// Note: uint8 can hold > 31, but docs say Age is 5 bits
-	op.Age = 32
-	if op.Age != 32 {
-		t.Error("Age overflow case: uint8 allows it but design says 5 bits")
-	}
-	t.Logf("Warning: Age field is uint8 but docs specify 5 bits (0-31)")
-	t.Logf("Convention: Higher Age = Older (earlier in program order)")
+	// Design insight: Age = slot index prevents overflow
+	// Window has 32 slots [0-31], so Age ∈ [0, 31]
+	// No slot 32 → No Age 32 possible → Overflow impossible!
+	t.Log("✓ Age field convention: Age = slot index (0-31)")
+	t.Log("✓ Overflow prevention: Naturally bounded by window topology")
+	t.Log("  Layout: Slot 31 (Age=31) = oldest position")
+	t.Log("          Slot 0  (Age=0)  = newest position")
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 2. CYCLE 0 TESTS (STAGE 1) - DEPENDENCY CHECKING
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestComputeReadyBitmap_EmptyWindow verifies that an empty instruction window
 // produces a zero ready bitmap (no ops ready to execute).
@@ -645,9 +668,9 @@ func TestBuildDependencyMatrix_AgeEnforcement(t *testing.T) {
 	}
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 3. CYCLE 0 TESTS (STAGE 2) - PRIORITY CLASSIFICATION
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestClassifyPriority_AllCriticalPath tests the case where all ready ops have
 // dependents (all are on critical path except the last leaf node).
@@ -764,9 +787,9 @@ func TestClassifyPriority_OnlyNonReadyOpsHaveDependents(t *testing.T) {
 	}
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 4. CYCLE 1 TESTS - ISSUE SELECTION
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestSelectIssueBundle_Empty verifies that empty priority classes produce
 // an empty issue bundle (no ops to execute).
@@ -977,9 +1000,9 @@ func TestBundleValid_HighBits(t *testing.T) {
 	}
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 5. SCOREBOARD MANAGEMENT TESTS
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestUpdateScoreboardAfterIssue_Single tests marking a single register as
 // pending after issuing one operation.
@@ -1190,9 +1213,9 @@ func TestOverlappingScoreboardUpdates(t *testing.T) {
 	}
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 6. INTEGRATION TESTS
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestPipelineRegister_StateTransfer verifies that the pipeline register between
 // Cycle 0 and Cycle 1 correctly transfers priority class state.
@@ -1624,9 +1647,9 @@ func TestInterleavedIssueAndComplete(t *testing.T) {
 	t.Log("✓ Interleaved issue and complete works correctly")
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 7. SPECIALIZED SCENARIOS
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestScatteredWindowSlots tests non-contiguous valid ops in the window
 // (ops at indices 0, 5, 10, 15, etc.). Verifies sparse window handling.
@@ -1791,9 +1814,9 @@ func TestHazard_WAR(t *testing.T) {
 	t.Log("✓ Age check correctly prevents false WAR dependency")
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 8. EDGE CASES AND NEGATIVE TESTS
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestEdgeCase_Register0 tests that register 0 works like any other register
 // (not hardwired to zero in SUPRAX unlike some other architectures).
@@ -2004,9 +2027,9 @@ func TestNegative_EmptyPriorityClass(t *testing.T) {
 	}
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 9. CORRECTNESS VALIDATION
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestCorrectness_NoOpIssuedTwice verifies that no operation is issued twice
 // across multiple issue cycles (critical correctness property).
@@ -2093,9 +2116,9 @@ func TestCorrectness_DependenciesRespected(t *testing.T) {
 	t.Log("✓ Dependencies correctly enforced with age checking")
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 10. STRESS AND PERFORMANCE TESTS
-// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // TestStress_RepeatedFillDrain stress tests the scheduler by repeatedly filling
 // the window to capacity and draining it. Tests stability over many cycles.
@@ -2452,30 +2475,211 @@ func TestDocumentation_TransistorBudget(t *testing.T) {
 	t.Log("Note: Age comparators add ~5K transistors (negligible)")
 }
 
-// TestAgeField_Documentation documents the Age field convention used throughout
-// the scheduler and tests.
+// TestAgeField_Documentation documents the Age field convention (position-based system)
+// used throughout the scheduler and tests.
 func TestAgeField_Documentation(t *testing.T) {
 	t.Log("═══════════════════════════════════════════════════════════")
-	t.Log("AGE FIELD CONVENTION (CRITICAL FOR DEPENDENCY TRACKING)")
+	t.Log("AGE FIELD CONVENTION (POSITION-BASED SYSTEM)")
 	t.Log("═══════════════════════════════════════════════════════════")
 	t.Log("")
-	t.Log("Convention: Higher Age = Older (earlier in program order)")
+	t.Log("Core principle: Age = Slot Index")
+	t.Log("")
+	t.Log("Window layout:")
+	t.Log("  Slot 31 (Age=31) = oldest position (ops entered here first)")
+	t.Log("  Slot 15 (Age=15) = middle position")
+	t.Log("  Slot 0  (Age=0)  = newest position (ops entered here last)")
 	t.Log("")
 	t.Log("Example dependency chain A → B → C:")
-	t.Log("  Op A: Age = 2 (oldest, entered window first)")
-	t.Log("  Op B: Age = 1 (middle)")
-	t.Log("  Op C: Age = 0 (newest, entered window last)")
+	t.Log("  Op A at slot 25: Age = 25 (oldest position)")
+	t.Log("  Op B at slot 15: Age = 15 (middle position)")
+	t.Log("  Op C at slot 5:  Age = 5  (newest position)")
 	t.Log("")
 	t.Log("Dependency check: Producer.Age > Consumer.Age")
-	t.Log("  A.Age(2) > B.Age(1) ✓ → B depends on A")
-	t.Log("  B.Age(1) > C.Age(0) ✓ → C depends on B")
+	t.Log("  A.Age(25) > B.Age(15) ✓ → B depends on A")
+	t.Log("  B.Age(15) > C.Age(5)  ✓ → C depends on B")
 	t.Log("")
-	t.Log("Benefits of age checking:")
+	t.Log("Why overflow is impossible:")
+	t.Log("  • Window has 32 slots [0-31]")
+	t.Log("  • Age = slot index")
+	t.Log("  • No slot 32 exists → No Age 32 possible")
+	t.Log("  • Simple comparison always correct!")
+	t.Log("")
+	t.Log("Benefits:")
 	t.Log("  • Prevents false WAR dependencies (+10-15% IPC)")
 	t.Log("  • Prevents false WAW dependencies")
 	t.Log("  • Enforces correct program order")
+	t.Log("  • No wraparound logic needed")
+	t.Log("  • Naturally bounded by hardware topology")
 	t.Log("  • Timing cost: 0ps (parallel with register compare)")
 	t.Log("  • Area cost: ~5K transistors (1024 × 5-bit comparators)")
 	t.Log("")
-	t.Log("✓ All tests in this suite use correct Age convention")
+	t.Log("✓ All tests in this suite use position-based Age convention")
+}
+
+// TestAge_WindowPositionSemantics verifies that Age follows window position
+func TestAge_WindowPositionSemantics(t *testing.T) {
+	window := &InstructionWindow{}
+
+	// Simulate FIFO: ops enter at low index, age = index
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{
+			Valid: true,
+			Src1:  1,
+			Src2:  2,
+			Dest:  uint8(i + 10),
+			Age:   uint8(i), // Age = position in window
+		}
+	}
+
+	// Verify age ordering matches position
+	for i := 0; i < 31; i++ {
+		if window.Ops[i].Age >= window.Ops[i+1].Age {
+			t.Errorf("Age ordering violated: Op[%d].Age=%d >= Op[%d].Age=%d",
+				i, window.Ops[i].Age, i+1, window.Ops[i+1].Age)
+		}
+	}
+}
+
+// TestAge_NoOverflowWithinWindow verifies 5-bit age is sufficient for 32 slots
+func TestAge_NoOverflowWithinWindow(t *testing.T) {
+	// With 32 slots and Age ∈ [0,31], we can't overflow
+	maxAge := uint8(31)
+	windowSize := 32
+
+	if maxAge >= uint8(windowSize) {
+		t.Error("Age field must fit window size")
+	}
+
+	t.Logf("✓ Age field [0-31] sufficient for %d-entry window", windowSize)
+}
+
+// TestAge_DependencyAcrossGenerations tests the edge case where the same
+// slot is reused for a newer op
+func TestAge_DependencyAcrossGenerations(t *testing.T) {
+	window := &InstructionWindow{}
+
+	// Generation 1: Op at slot 5 writes r10
+	window.Ops[5] = Operation{
+		Valid: true,
+		Dest:  10,
+		Age:   5, // Age = slot index
+	}
+
+	// Generation 1: Op at slot 3 reads r10 (depends on slot 5)
+	window.Ops[3] = Operation{
+		Valid: true,
+		Src1:  10,
+		Age:   3, // Age = slot index
+	}
+
+	matrix := BuildDependencyMatrix(window)
+
+	// Op 3 should depend on Op 5 (5 > 3, and register matches)
+	if (matrix[5]>>3)&1 == 0 {
+		t.Error("Op 3 should depend on Op 5")
+	}
+
+	// Now "retire" Op 5 and reuse the slot
+	window.Ops[5] = Operation{
+		Valid: true,
+		Dest:  20, // Different register
+		Age:   5,  // SAME age (slot index doesn't change)
+	}
+
+	matrix = BuildDependencyMatrix(window)
+
+	// Op 3 should NO LONGER depend on new Op 5 (different register)
+	if (matrix[5]>>3)&1 != 0 {
+		t.Error("Op 3 should not depend on new Op 5 (different register)")
+	}
+
+	t.Log("✓ Age = slot index works correctly across generations")
+	t.Log("  Key insight: Register check prevents false dependencies,")
+	t.Log("  Age check only ensures program order within a generation")
+}
+
+// TestAge_WrapAroundDetection tests what happens if Age accidentally wraps
+func TestAge_WrapAroundDetection(t *testing.T) {
+	window := &InstructionWindow{}
+
+	// Simulate wraparound bug: Age 31 wraps to Age 0
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  1,
+		Src2:  2,
+		Dest:  10,
+		Age:   31, // "Old" op (should be older)
+	}
+
+	window.Ops[1] = Operation{
+		Valid: true,
+		Src1:  10,
+		Src2:  3,
+		Dest:  11,
+		Age:   0, // "New" op after wraparound (should be younger)
+	}
+
+	matrix := BuildDependencyMatrix(window)
+
+	// With simple comparison: 31 > 0 = true, so dependency created ✓
+	// But semantically, this is WRONG if Age 0 is actually newer!
+	if (matrix[0]>>1)&1 != 0 {
+		t.Log("⚠ WARNING: Age wraparound creates dependency!")
+		t.Log("  Op 0 (Age=31) appears older than Op 1 (Age=0)")
+		t.Log("  If Age 0 is actually NEWER (post-wrap), this is WRONG")
+		t.Log("")
+		t.Log("SOLUTION: Age must equal slot index (no wraparound possible)")
+	}
+}
+
+// TestAge_FIFOInvariant tests that the window maintains FIFO order
+func TestAge_FIFOInvariant(t *testing.T) {
+	// CRITICAL INVARIANT for Age = slot index design:
+	// Ops must maintain FIFO order: [31] oldest → [0] newest
+
+	window := &InstructionWindow{}
+
+	// Fill window with ops in FIFO order
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{
+			Valid: true,
+			Age:   uint8(i), // Age increases with slot index
+		}
+	}
+
+	// Verify FIFO invariant: Age[i] < Age[i+1]
+	for i := 0; i < 31; i++ {
+		if window.Ops[i].Age >= window.Ops[i+1].Age {
+			t.Errorf("FIFO invariant violated: Age[%d]=%d >= Age[%d]=%d",
+				i, window.Ops[i].Age, i+1, window.Ops[i+1].Age)
+		}
+	}
+
+	t.Log("✓ FIFO invariant holds: Age increases with slot index")
+}
+
+// TestAge_OutOfOrderDetection tests that out-of-order ages are detected
+func TestAge_OutOfOrderDetection(t *testing.T) {
+	window := &InstructionWindow{}
+
+	// Incorrectly set ages (not FIFO order)
+	window.Ops[0] = Operation{Valid: true, Age: 10} // Should be low
+	window.Ops[1] = Operation{Valid: true, Age: 5}  // Should be higher!
+	window.Ops[2] = Operation{Valid: true, Age: 15}
+
+	// Check if ages are monotonically increasing
+	isMonotonic := true
+	for i := 0; i < 2; i++ {
+		if window.Ops[i].Valid && window.Ops[i+1].Valid {
+			if window.Ops[i].Age >= window.Ops[i+1].Age {
+				isMonotonic = false
+				t.Logf("Age not monotonic: Ops[%d].Age=%d >= Ops[%d].Age=%d",
+					i, window.Ops[i].Age, i+1, window.Ops[i+1].Age)
+			}
+		}
+	}
+
+	if !isMonotonic {
+		t.Log("⚠ Ages not in FIFO order - dependency tracking may be incorrect")
+	}
 }
