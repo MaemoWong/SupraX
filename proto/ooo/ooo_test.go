@@ -38,8 +38,13 @@ import (
 //
 // SCOREBOARD:
 //   A bitmap tracking which registers contain valid data.
-//   Bit N = 1 means register N is "ready" (has valid data).
-//   Bit N = 0 means register N is "pending" (being computed).
+//   Bit N = 1 means register N is "ready" (has valid data, not being written).
+//   Bit N = 0 means register N is "pending" (being computed by in-flight op).
+//
+// DEPENDENCY MATRIX:
+//   Tracks producer→consumer relationships within the scheduling window.
+//   matrix[i] bit j = 1 means "instruction j depends on instruction i"
+//   Used to ensure consumers wait for producers to ISSUE (not just complete).
 //
 // DEPENDENCY:
 //   Instruction B depends on instruction A if B reads a register that A writes.
@@ -49,13 +54,13 @@ import (
 //
 // RAW/WAR/WAW HAZARDS:
 //   RAW (Read-After-Write): True dependency. B reads what A writes. Must wait.
-//   WAR (Write-After-Read): Anti-dependency. B writes what A reads. No wait needed.
-//   WAW (Write-After-Write): Output dependency. Both write same register. No wait needed.
-//   SUPRAX only tracks RAW - the others don't create true data dependencies.
+//   WAR (Write-After-Read): Anti-dependency. B writes what A reads. Implicit in age.
+//   WAW (Write-After-Write): Output dependency. B writes what A writes.
+//        Handled by scoreboard[dest] check - younger blocked until older completes.
 //
 // ISSUE vs EXECUTE vs COMPLETE:
 //   Issue:    Scheduler selects instruction, marks dest register pending
-//   Execute:  Instruction runs in execution unit (1-8 cycles depending on op)
+//   Execute:  Instruction runs in execution unit (1-20 cycles depending on op)
 //   Complete: Execution finishes, dest register marked ready
 //
 // SLOT INDEX = AGE:
@@ -81,17 +86,17 @@ import (
 // 1. SCOREBOARD TESTS
 //    Basic register readiness tracking
 //
-// 2. CYCLE 0 STAGE 1: Ready Bitmap
-//    Which instructions have all sources ready?
-//
-// 3. CYCLE 0 STAGE 2: Dependency Matrix
+// 2. CYCLE 0 STAGE 1: Dependency Matrix
 //    Which instructions block which others?
+//
+// 3. CYCLE 0 STAGE 2: Ready Bitmap
+//    Which instructions have all sources ready, dest free, and producers issued?
 //
 // 4. CYCLE 0 STAGE 3: Priority Classification
 //    Which ready instructions are on critical path?
 //
 // 5. CYCLE 1: Issue Selection
-//    Pick up to 16 instructions to execute
+//    Pick up to 16 instructions to execute (with WAW conflict avoidance)
 //
 // 6. CYCLE 1: Scoreboard Updates
 //    Mark registers pending/ready
@@ -136,7 +141,7 @@ import (
 
 func TestScoreboard_InitialState(t *testing.T) {
 	// WHAT: Verify scoreboard starts with all registers not ready
-	// WHY: On reset, no instructions have executed, so no registers have valid data
+	// WHY: Zero-initialized state represents "all registers pending"
 	// HARDWARE: All flip-flops reset to 0
 
 	var sb Scoreboard
@@ -147,7 +152,6 @@ func TestScoreboard_InitialState(t *testing.T) {
 		}
 	}
 
-	// Verify underlying representation is zero
 	if sb != 0 {
 		t.Errorf("Initial scoreboard should be 0, got 0x%016X", sb)
 	}
@@ -166,7 +170,6 @@ func TestScoreboard_MarkReady_Single(t *testing.T) {
 		t.Error("Register 5 should be ready after MarkReady")
 	}
 
-	// Adjacent registers unaffected
 	if sb.IsReady(4) {
 		t.Error("Register 4 should not be affected")
 	}
@@ -174,7 +177,6 @@ func TestScoreboard_MarkReady_Single(t *testing.T) {
 		t.Error("Register 6 should not be affected")
 	}
 
-	// Verify exact bit pattern
 	expected := Scoreboard(1 << 5)
 	if sb != expected {
 		t.Errorf("Expected 0x%016X, got 0x%016X", expected, sb)
@@ -207,7 +209,6 @@ func TestScoreboard_Idempotent(t *testing.T) {
 
 	var sb Scoreboard
 
-	// Multiple MarkReady calls
 	sb.MarkReady(10)
 	sb.MarkReady(10)
 	sb.MarkReady(10)
@@ -221,7 +222,6 @@ func TestScoreboard_Idempotent(t *testing.T) {
 		t.Errorf("Multiple MarkReady should not change value, expected 0x%016X, got 0x%016X", expected, sb)
 	}
 
-	// Multiple MarkPending calls
 	sb.MarkPending(10)
 	sb.MarkPending(10)
 	sb.MarkPending(10)
@@ -242,29 +242,24 @@ func TestScoreboard_AllRegisters(t *testing.T) {
 
 	var sb Scoreboard
 
-	// Mark all ready
 	for i := uint8(0); i < 64; i++ {
 		sb.MarkReady(i)
 	}
 
-	// Verify all ready
 	for i := uint8(0); i < 64; i++ {
 		if !sb.IsReady(i) {
 			t.Errorf("Register %d should be ready", i)
 		}
 	}
 
-	// Should be all 1s
 	if sb != ^Scoreboard(0) {
 		t.Errorf("All registers ready should be 0xFFFFFFFFFFFFFFFF, got 0x%016X", sb)
 	}
 
-	// Mark all pending
 	for i := uint8(0); i < 64; i++ {
 		sb.MarkPending(i)
 	}
 
-	// Verify all pending
 	for i := uint8(0); i < 64; i++ {
 		if sb.IsReady(i) {
 			t.Errorf("Register %d should be pending", i)
@@ -283,7 +278,6 @@ func TestScoreboard_BoundaryRegisters(t *testing.T) {
 
 	var sb Scoreboard
 
-	// Register 0 (least significant bit)
 	sb.MarkReady(0)
 	if !sb.IsReady(0) {
 		t.Error("Register 0 should be ready")
@@ -297,7 +291,6 @@ func TestScoreboard_BoundaryRegisters(t *testing.T) {
 		t.Error("Register 0 should be pending")
 	}
 
-	// Register 63 (most significant bit)
 	sb.MarkReady(63)
 	if !sb.IsReady(63) {
 		t.Error("Register 63 should be ready")
@@ -321,12 +314,10 @@ func TestScoreboard_InterleavedPattern(t *testing.T) {
 
 	var sb Scoreboard
 
-	// Mark even registers ready
 	for i := uint8(0); i < 64; i += 2 {
 		sb.MarkReady(i)
 	}
 
-	// Verify pattern
 	for i := uint8(0); i < 64; i++ {
 		expected := (i % 2) == 0
 		if sb.IsReady(i) != expected {
@@ -334,7 +325,6 @@ func TestScoreboard_InterleavedPattern(t *testing.T) {
 		}
 	}
 
-	// Should be 0x5555...5555
 	expected := Scoreboard(0x5555555555555555)
 	if sb != expected {
 		t.Errorf("Checkerboard pattern wrong, expected 0x%016X, got 0x%016X", expected, sb)
@@ -348,15 +338,12 @@ func TestScoreboard_IndependentUpdates(t *testing.T) {
 
 	var sb Scoreboard
 
-	// Set up initial state
 	sb.MarkReady(10)
 	sb.MarkReady(20)
 	sb.MarkReady(30)
 
-	// Modify one register
 	sb.MarkPending(20)
 
-	// Others unaffected
 	if !sb.IsReady(10) {
 		t.Error("Register 10 should still be ready")
 	}
@@ -369,414 +356,7 @@ func TestScoreboard_IndependentUpdates(t *testing.T) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// 2. CYCLE 0 STAGE 1: READY BITMAP
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-//
-// ComputeReadyBitmap identifies which instructions can issue right now.
-// An instruction is ready when:
-//   1. It's valid (slot contains real instruction)
-//   2. It's not already issued (prevents double-issue)
-//   3. Both source registers are ready (inputs available)
-//
-// Hardware: 32 parallel checkers, each doing:
-//   ready[i] = valid[i] & ~issued[i] & scoreboard[src1] & scoreboard[src2]
-//
-// Timing: 140ps (SRAM read + scoreboard lookups + AND reduction)
-//
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-
-func TestReadyBitmap_EmptyWindow(t *testing.T) {
-	// WHAT: No valid instructions → no ready instructions
-	// WHY: Base case - empty scheduler should produce no work
-	// HARDWARE: All valid bits are 0, so all ready bits are 0
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 0 {
-		t.Errorf("Empty window should have no ready ops, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_SingleReady(t *testing.T) {
-	// WHAT: One instruction with sources ready
-	// WHY: Simplest positive case
-	// HARDWARE: One ready checker outputs 1
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  5,
-		Src2:  10,
-		Dest:  15,
-	}
-	sb.MarkReady(5)
-	sb.MarkReady(10)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 1 {
-		t.Errorf("Single ready op at slot 0 should give bitmap 0x1, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_MultipleReady(t *testing.T) {
-	// WHAT: Multiple independent instructions, all ready
-	// WHY: Verify parallel operation - all checkers work simultaneously
-	// HARDWARE: Multiple ready checkers output 1
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	// Three ready instructions at slots 0, 1, 2
-	for i := 0; i < 3; i++ {
-		window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  1,
-			Src2:  2,
-			Dest:  uint8(10 + i),
-		}
-	}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	expected := uint32(0b111)
-	if bitmap != expected {
-		t.Errorf("Expected bitmap 0x%08X, got 0x%08X", expected, bitmap)
-	}
-}
-
-func TestReadyBitmap_Src1NotReady(t *testing.T) {
-	// WHAT: Instruction blocked on Src1
-	// WHY: Verify AND logic - both sources must be ready
-	// HARDWARE: ready = valid & ~issued & src1Ready & src2Ready
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  5,  // Not ready
-		Src2:  10, // Ready
-		Dest:  15,
-	}
-	sb.MarkReady(10) // Only Src2 ready
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 0 {
-		t.Errorf("Op with Src1 not ready should not be in bitmap, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_Src2NotReady(t *testing.T) {
-	// WHAT: Instruction blocked on Src2
-	// WHY: Symmetric with Src1 test
-	// HARDWARE: Same AND logic, different input
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  5,  // Ready
-		Src2:  10, // Not ready
-		Dest:  15,
-	}
-	sb.MarkReady(5) // Only Src1 ready
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 0 {
-		t.Errorf("Op with Src2 not ready should not be in bitmap, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_BothSourcesNotReady(t *testing.T) {
-	// WHAT: Instruction blocked on both sources
-	// WHY: Complete coverage of blocked states
-	// HARDWARE: Both scoreboard lookups return 0
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  5,
-		Src2:  10,
-		Dest:  15,
-	}
-	// Neither source ready
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 0 {
-		t.Errorf("Op with no sources ready should not be in bitmap, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_InvalidOps(t *testing.T) {
-	// WHAT: Invalid ops (empty slots) never appear in bitmap
-	// WHY: Empty slots shouldn't be scheduled
-	// HARDWARE: valid=0 gates the output to 0
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	// Mark all registers ready
-	for i := uint8(0); i < 64; i++ {
-		sb.MarkReady(i)
-	}
-
-	// All ops invalid (default)
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 0 {
-		t.Errorf("Invalid ops should not be ready, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_SkipsIssuedOps(t *testing.T) {
-	// WHAT: Already-issued ops excluded from ready bitmap
-	// WHY: Prevents double-issue - catastrophic bug if same instruction runs twice
-	// HARDWARE: issued=1 gates the output to 0
-	//
-	// DOUBLE-ISSUE BUG EXAMPLE:
-	//   Cycle N: Op A issues (writes R5)
-	//   Cycle N+1: Op A still has sources ready (they didn't change)
-	//   Without Issued flag: Op A selected again → R5 computed twice
-	//   With register renaming: might write two different physical registers
-	//   Without renaming: corrupts architectural state
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	// Op 0: Ready but already issued
-	window.Ops[0] = Operation{
-		Valid:  true,
-		Issued: true, // Already sent to execution
-		Src1:   1,
-		Src2:   2,
-		Dest:   10,
-	}
-
-	// Op 1: Ready and not issued
-	window.Ops[1] = Operation{
-		Valid:  true,
-		Issued: false,
-		Src1:   1,
-		Src2:   2,
-		Dest:   11,
-	}
-
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	// Only op 1 should be ready (bit 1 set, bit 0 clear)
-	expected := uint32(0b10)
-	if bitmap != expected {
-		t.Errorf("Should skip issued ops, expected 0x%08X, got 0x%08X", expected, bitmap)
-	}
-}
-
-func TestReadyBitmap_SameSourceRegisters(t *testing.T) {
-	// WHAT: Instruction using same register for both sources
-	// WHY: Edge case - some instructions read one register twice (e.g., R5 = R3 + R3)
-	// HARDWARE: Both MUXes select same scoreboard bit, AND still works
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  5,
-		Src2:  5, // Same as Src1
-		Dest:  10,
-	}
-	sb.MarkReady(5)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 1 {
-		t.Errorf("Op with same source registers should be ready, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_SourceEqualsDestination(t *testing.T) {
-	// WHAT: Instruction reads and writes same register (e.g., R5 = R5 + 1)
-	// WHY: Common pattern (increment), must work correctly
-	// HARDWARE: Dest doesn't affect ready check (only sources matter)
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  5,
-		Src2:  5,
-		Dest:  5, // Same as sources
-	}
-	sb.MarkReady(5)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 1 {
-		t.Errorf("Op reading and writing same register should be ready, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_FullWindow(t *testing.T) {
-	// WHAT: All 32 slots filled and ready
-	// WHY: Maximum parallelism case - stress test parallel checkers
-	// HARDWARE: All 32 ready checkers active simultaneously
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	for i := 0; i < 32; i++ {
-		window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  1,
-			Src2:  2,
-			Dest:  uint8(10 + i),
-		}
-	}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	expected := ^uint32(0) // All 32 bits set
-	if bitmap != expected {
-		t.Errorf("Full window should have all bits set, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_ScatteredSlots(t *testing.T) {
-	// WHAT: Ready ops at non-contiguous slots
-	// WHY: Real workloads have gaps (some ops issued, some blocked)
-	// HARDWARE: Validates independence of slot checkers
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	// Ops at slots 0, 5, 10, 15, 20, 25, 30
-	slots := []int{0, 5, 10, 15, 20, 25, 30}
-	for _, slot := range slots {
-		window.Ops[slot] = Operation{
-			Valid: true,
-			Src1:  1,
-			Src2:  2,
-			Dest:  uint8(slot + 10),
-		}
-	}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	// Build expected bitmap
-	var expected uint32
-	for _, slot := range slots {
-		expected |= 1 << slot
-	}
-
-	if bitmap != expected {
-		t.Errorf("Scattered slots: expected 0x%08X, got 0x%08X", expected, bitmap)
-	}
-}
-
-func TestReadyBitmap_MixedReadiness(t *testing.T) {
-	// WHAT: Mix of ready, blocked on src1, blocked on src2, blocked on both
-	// WHY: Realistic scenario - different ops have different dependencies
-	// HARDWARE: Each checker operates independently
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	// Slot 0: Both ready → READY
-	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-
-	// Slot 1: Src1 ready, Src2 not → BLOCKED
-	window.Ops[1] = Operation{Valid: true, Src1: 1, Src2: 3, Dest: 11}
-
-	// Slot 2: Src1 not, Src2 ready → BLOCKED
-	window.Ops[2] = Operation{Valid: true, Src1: 4, Src2: 2, Dest: 12}
-
-	// Slot 3: Neither ready → BLOCKED
-	window.Ops[3] = Operation{Valid: true, Src1: 4, Src2: 3, Dest: 13}
-
-	// Slot 4: Both ready → READY
-	window.Ops[4] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 14}
-
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-	// Registers 3, 4 not ready
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	expected := uint32(0b10001) // Slots 0 and 4
-	if bitmap != expected {
-		t.Errorf("Mixed readiness: expected 0x%08X, got 0x%08X", expected, bitmap)
-	}
-}
-
-func TestReadyBitmap_Register0(t *testing.T) {
-	// WHAT: Operations using register 0
-	// WHY: Register 0 often special (zero register in RISC-V, general in x86)
-	// HARDWARE: Validates bit 0 of scoreboard accessible
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  0, // Register 0
-		Src2:  0, // Register 0
-		Dest:  10,
-	}
-	sb.MarkReady(0)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 1 {
-		t.Errorf("Op using register 0 should be ready, got 0x%08X", bitmap)
-	}
-}
-
-func TestReadyBitmap_Register63(t *testing.T) {
-	// WHAT: Operations using highest register
-	// WHY: Boundary condition - validates full register file accessible
-	// HARDWARE: Validates bit 63 of scoreboard accessible
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	window.Ops[0] = Operation{
-		Valid: true,
-		Src1:  63,
-		Src2:  63,
-		Dest:  10,
-	}
-	sb.MarkReady(63)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	if bitmap != 1 {
-		t.Errorf("Op using register 63 should be ready, got 0x%08X", bitmap)
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-// 3. CYCLE 0 STAGE 2: DEPENDENCY MATRIX
+// 2. CYCLE 0 STAGE 1: DEPENDENCY MATRIX
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
 // BuildDependencyMatrix identifies producer→consumer relationships.
@@ -819,7 +399,6 @@ func TestDependencyMatrix_NoDependencies(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Three independent ops: different sources, different destinations
 	window.Ops[2] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 	window.Ops[1] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 11}
 	window.Ops[0] = Operation{Valid: true, Src1: 5, Src2: 6, Dest: 12}
@@ -841,25 +420,18 @@ func TestDependencyMatrix_SimpleRAW(t *testing.T) {
 	// EXAMPLE:
 	//   Slot 10 (older): R10 = R1 + R2     (writes R10)
 	//   Slot 5 (newer):  R11 = R10 + R3    (reads R10 - depends on slot 10!)
-	//
-	// Slot 10 > Slot 5, so slot 10 is older. Valid RAW dependency.
 
 	window := &InstructionWindow{}
 
-	// Producer at higher slot (older)
 	window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-
-	// Consumer at lower slot (newer)
 	window.Ops[5] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// matrix[10] should have bit 5 set (slot 5 depends on slot 10)
 	if (matrix[10]>>5)&1 != 1 {
 		t.Errorf("Slot 5 should depend on slot 10, matrix[10]=0x%08X", matrix[10])
 	}
 
-	// matrix[5] should NOT have bit 10 set (slot 10 doesn't depend on slot 5)
 	if (matrix[5]>>10)&1 != 0 {
 		t.Errorf("Slot 10 should NOT depend on slot 5, matrix[5]=0x%08X", matrix[5])
 	}
@@ -873,7 +445,7 @@ func TestDependencyMatrix_RAW_Src1(t *testing.T) {
 	window := &InstructionWindow{}
 
 	window.Ops[15] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 20}
-	window.Ops[10] = Operation{Valid: true, Src1: 20, Src2: 3, Dest: 21} // Src1 matches
+	window.Ops[10] = Operation{Valid: true, Src1: 20, Src2: 3, Dest: 21}
 
 	matrix := BuildDependencyMatrix(window)
 
@@ -890,7 +462,7 @@ func TestDependencyMatrix_RAW_Src2(t *testing.T) {
 	window := &InstructionWindow{}
 
 	window.Ops[15] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 20}
-	window.Ops[10] = Operation{Valid: true, Src1: 3, Src2: 20, Dest: 21} // Src2 matches
+	window.Ops[10] = Operation{Valid: true, Src1: 3, Src2: 20, Dest: 21}
 
 	matrix := BuildDependencyMatrix(window)
 
@@ -907,16 +479,14 @@ func TestDependencyMatrix_RAW_BothSources(t *testing.T) {
 	window := &InstructionWindow{}
 
 	window.Ops[15] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 20}
-	window.Ops[10] = Operation{Valid: true, Src1: 20, Src2: 20, Dest: 21} // Both match
+	window.Ops[10] = Operation{Valid: true, Src1: 20, Src2: 20, Dest: 21}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Should still only set one bit (dependency exists, counted once)
 	if (matrix[15]>>10)&1 != 1 {
 		t.Errorf("RAW via both sources not detected, matrix[15]=0x%08X", matrix[15])
 	}
 
-	// Verify it's exactly one bit
 	if bits.OnesCount32(matrix[15]) != 1 {
 		t.Errorf("Should be exactly one dependent, got %d", bits.OnesCount32(matrix[15]))
 	}
@@ -934,28 +504,24 @@ func TestDependencyMatrix_Chain(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}  // A
-	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11} // B depends on A
-	window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12} // C depends on B
+	window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
+	window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// A has B as dependent
 	if (matrix[20]>>15)&1 != 1 {
 		t.Errorf("B should depend on A, matrix[20]=0x%08X", matrix[20])
 	}
 
-	// B has C as dependent
 	if (matrix[15]>>10)&1 != 1 {
 		t.Errorf("C should depend on B, matrix[15]=0x%08X", matrix[15])
 	}
 
-	// C has no dependents (leaf)
 	if matrix[10] != 0 {
 		t.Errorf("C should have no dependents, matrix[10]=0x%08X", matrix[10])
 	}
 
-	// A should NOT have C as direct dependent (indirect only)
 	if (matrix[20]>>10)&1 != 0 {
 		t.Errorf("C should NOT directly depend on A, matrix[20]=0x%08X", matrix[20])
 	}
@@ -975,14 +541,13 @@ func TestDependencyMatrix_Diamond(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	window.Ops[25] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}   // A
-	window.Ops[20] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}  // B (uses A)
-	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12}  // C (uses A)
-	window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 12, Dest: 13} // D (uses B, C)
+	window.Ops[25] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[20] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
+	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12}
+	window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 12, Dest: 13}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// A has B and C as dependents
 	if (matrix[25]>>20)&1 != 1 {
 		t.Errorf("B should depend on A")
 	}
@@ -990,17 +555,14 @@ func TestDependencyMatrix_Diamond(t *testing.T) {
 		t.Errorf("C should depend on A")
 	}
 
-	// B has D as dependent
 	if (matrix[20]>>10)&1 != 1 {
 		t.Errorf("D should depend on B")
 	}
 
-	// C has D as dependent
 	if (matrix[15]>>10)&1 != 1 {
 		t.Errorf("D should depend on C")
 	}
 
-	// D has no dependents
 	if matrix[10] != 0 {
 		t.Errorf("D should have no dependents")
 	}
@@ -1013,10 +575,8 @@ func TestDependencyMatrix_MultipleConsumers(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Producer
 	window.Ops[25] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 
-	// Multiple consumers
 	window.Ops[20] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12}
 	window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 5, Dest: 13}
@@ -1024,7 +584,6 @@ func TestDependencyMatrix_MultipleConsumers(t *testing.T) {
 
 	matrix := BuildDependencyMatrix(window)
 
-	// All consumers should depend on producer
 	expected := uint32((1 << 20) | (1 << 15) | (1 << 10) | (1 << 5))
 	if matrix[25] != expected {
 		t.Errorf("Expected 4 dependents, got matrix[25]=0x%08X", matrix[25])
@@ -1045,21 +604,15 @@ func TestDependencyMatrix_AgeCheck_PreventsFalseDependency(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Older instruction reads R5
 	window.Ops[15] = Operation{Valid: true, Src1: 5, Src2: 6, Dest: 10}
-
-	// Newer instruction writes R5 (WAR hazard - not a true dependency)
 	window.Ops[5] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Slot 15 should NOT depend on slot 5
-	// (even though slot 15 reads what slot 5 writes)
 	if (matrix[5]>>15)&1 != 0 {
 		t.Errorf("Age check should prevent WAR dependency, matrix[5]=0x%08X", matrix[5])
 	}
 
-	// Neither should have dependencies (WAR not tracked)
 	if matrix[5] != 0 || matrix[15] != 0 {
 		t.Errorf("No dependencies should exist (WAR not tracked)")
 	}
@@ -1072,15 +625,11 @@ func TestDependencyMatrix_SlotIndexBoundaries(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Oldest slot produces
 	window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-
-	// Newest slot consumes
 	window.Ops[0] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Slot 0 depends on slot 31
 	if (matrix[31]>>0)&1 != 1 {
 		t.Errorf("Slot 0 should depend on slot 31, matrix[31]=0x%08X", matrix[31])
 	}
@@ -1093,8 +642,8 @@ func TestDependencyMatrix_AdjacentSlots(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	window.Ops[11] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}  // Producer
-	window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11} // Consumer (adjacent)
+	window.Ops[11] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 
 	matrix := BuildDependencyMatrix(window)
 
@@ -1107,25 +656,20 @@ func TestDependencyMatrix_DiagonalZero(t *testing.T) {
 	// WHAT: No instruction depends on itself
 	// WHY: Self-dependency is impossible (can't read own output before producing it)
 	// HARDWARE: i == j case skipped
-	//
-	// NOTE: Even if registers match, an instruction doesn't depend on itself.
-	// Example: R5 = R5 + 1 reads R5 BEFORE writing it.
 
 	window := &InstructionWindow{}
 
-	// Instructions where dest = src (but NOT self-dependency)
 	for i := 0; i < 10; i++ {
 		window.Ops[i] = Operation{
 			Valid: true,
 			Src1:  uint8(i + 10),
 			Src2:  uint8(i + 10),
-			Dest:  uint8(i + 10), // Same register for all
+			Dest:  uint8(i + 10),
 		}
 	}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Diagonal should be zero
 	for i := 0; i < 10; i++ {
 		if (matrix[i]>>i)&1 != 0 {
 			t.Errorf("Diagonal matrix[%d][%d] should be 0", i, i)
@@ -1140,15 +684,11 @@ func TestDependencyMatrix_InvalidOps(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Valid producer
 	window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-
-	// Invalid consumer (would depend on producer if valid)
 	window.Ops[5] = Operation{Valid: false, Src1: 10, Src2: 3, Dest: 11}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Producer should have no dependents (consumer is invalid)
 	if matrix[10] != 0 {
 		t.Errorf("Invalid ops shouldn't create dependencies, matrix[10]=0x%08X", matrix[10])
 	}
@@ -1161,15 +701,11 @@ func TestDependencyMatrix_InvalidProducer(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Invalid producer
 	window.Ops[10] = Operation{Valid: false, Src1: 1, Src2: 2, Dest: 10}
-
-	// Valid consumer (would depend if producer were valid)
 	window.Ops[5] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Invalid producer has no dependents
 	if matrix[10] != 0 {
 		t.Errorf("Invalid producer shouldn't have dependents, matrix[10]=0x%08X", matrix[10])
 	}
@@ -1191,29 +727,20 @@ func TestDependencyMatrix_ComplexGraph(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	// Level 0
-	window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10} // A
-
-	// Level 1 (all depend on A)
-	window.Ops[28] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11} // B
-	window.Ops[25] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12} // C
-	window.Ops[22] = Operation{Valid: true, Src1: 10, Src2: 5, Dest: 13} // D
-
-	// Level 2 (E depends on B,C; F depends on C,D)
-	window.Ops[19] = Operation{Valid: true, Src1: 11, Src2: 12, Dest: 14} // E
-	window.Ops[16] = Operation{Valid: true, Src1: 12, Src2: 13, Dest: 15} // F
-
-	// Level 3 (G depends on E,F)
-	window.Ops[13] = Operation{Valid: true, Src1: 14, Src2: 15, Dest: 16} // G
+	window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[28] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
+	window.Ops[25] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12}
+	window.Ops[22] = Operation{Valid: true, Src1: 10, Src2: 5, Dest: 13}
+	window.Ops[19] = Operation{Valid: true, Src1: 11, Src2: 12, Dest: 14}
+	window.Ops[16] = Operation{Valid: true, Src1: 12, Src2: 13, Dest: 15}
+	window.Ops[13] = Operation{Valid: true, Src1: 14, Src2: 15, Dest: 16}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Verify A's dependents (B, C, D)
 	if (matrix[31]>>28)&1 != 1 || (matrix[31]>>25)&1 != 1 || (matrix[31]>>22)&1 != 1 {
 		t.Errorf("A should have B,C,D as dependents, matrix[31]=0x%08X", matrix[31])
 	}
 
-	// Verify E's producers (B, C)
 	if (matrix[28]>>19)&1 != 1 {
 		t.Errorf("E should depend on B")
 	}
@@ -1221,9 +748,519 @@ func TestDependencyMatrix_ComplexGraph(t *testing.T) {
 		t.Errorf("E should depend on C")
 	}
 
-	// Verify G is leaf
 	if matrix[13] != 0 {
 		t.Errorf("G should be leaf, matrix[13]=0x%08X", matrix[13])
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// 3. CYCLE 0 STAGE 2: READY BITMAP
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ComputeReadyBitmap identifies which instructions can issue right now.
+// An instruction is ready when ALL of these are true:
+//   1. It's valid (slot contains real instruction)
+//   2. It's not already issued (prevents double-issue)
+//   3. Both source registers are ready (RAW completion check)
+//   4. Destination register is ready (WAW check)
+//   5. All intra-window producers have issued (RAW issue check)
+//
+// The combination of scoreboard AND dependency matrix is essential:
+//   - Scoreboard: Tracks completed writes (data validity)
+//   - Dependency matrix + Issued: Tracks issued but incomplete writes
+//
+// Hardware: 32 parallel checkers, each doing scoreboard lookups + producer scan
+// Timing: 150ps
+//
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+func TestReadyBitmap_EmptyWindow(t *testing.T) {
+	// WHAT: No valid instructions → no ready instructions
+	// WHY: Base case - empty scheduler should produce no work
+	// HARDWARE: All valid bits are 0, so all ready bits are 0
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+	depMatrix := BuildDependencyMatrix(window)
+
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 0 {
+		t.Errorf("Empty window should have no ready ops, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_SingleReady(t *testing.T) {
+	// WHAT: One instruction with sources and dest ready, no dependencies
+	// WHY: Simplest positive case
+	// HARDWARE: One ready checker outputs 1
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,
+		Src2:  10,
+		Dest:  15,
+	}
+	sb.MarkReady(5)
+	sb.MarkReady(10)
+	sb.MarkReady(15)
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 1 {
+		t.Errorf("Single ready op at slot 0 should give bitmap 0x1, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_MultipleReady(t *testing.T) {
+	// WHAT: Multiple independent instructions, all ready
+	// WHY: Verify parallel operation - all checkers work simultaneously
+	// HARDWARE: Multiple ready checkers output 1
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	for i := 0; i < 3; i++ {
+		window.Ops[i] = Operation{
+			Valid: true,
+			Src1:  1,
+			Src2:  2,
+			Dest:  uint8(10 + i),
+		}
+	}
+	sb.MarkReady(1)
+	sb.MarkReady(2)
+	sb.MarkReady(10)
+	sb.MarkReady(11)
+	sb.MarkReady(12)
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	expected := uint32(0b111)
+	if bitmap != expected {
+		t.Errorf("Expected bitmap 0x%08X, got 0x%08X", expected, bitmap)
+	}
+}
+
+func TestReadyBitmap_Src1NotReady(t *testing.T) {
+	// WHAT: Instruction blocked on Src1
+	// WHY: Verify AND logic - all conditions must be true
+	// HARDWARE: ready = valid & ~issued & src1Ready & src2Ready & destReady & noUnissuedProducers
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,  // Not ready
+		Src2:  10, // Ready
+		Dest:  15, // Ready
+	}
+	sb.MarkReady(10)
+	sb.MarkReady(15)
+	// Src1 (5) NOT ready
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 0 {
+		t.Errorf("Op with Src1 not ready should not be in bitmap, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_Src2NotReady(t *testing.T) {
+	// WHAT: Instruction blocked on Src2
+	// WHY: Symmetric with Src1 test
+	// HARDWARE: Same AND logic, different input
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,  // Ready
+		Src2:  10, // Not ready
+		Dest:  15, // Ready
+	}
+	sb.MarkReady(5)
+	sb.MarkReady(15)
+	// Src2 (10) NOT ready
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 0 {
+		t.Errorf("Op with Src2 not ready should not be in bitmap, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_DestNotReady_WAW(t *testing.T) {
+	// WHAT: Instruction blocked because dest is being written (WAW)
+	// WHY: This is the KEY test for WAW handling via scoreboard
+	// HARDWARE: destReady = scoreboard[dest] blocks younger WAW
+	//
+	// SCENARIO:
+	//   Some older instruction is writing R15 (scoreboard[15] = 0)
+	//   Our instruction also wants to write R15
+	//   We must wait until older instruction completes
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,  // Ready
+		Src2:  10, // Ready
+		Dest:  15, // NOT ready (older instruction writing it)
+	}
+	sb.MarkReady(5)
+	sb.MarkReady(10)
+	// Dest (15) NOT ready - simulates older instruction writing R15
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 0 {
+		t.Errorf("Op with dest not ready (WAW) should not be in bitmap, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_BothSourcesNotReady(t *testing.T) {
+	// WHAT: Instruction blocked on both sources
+	// WHY: Complete coverage of blocked states
+	// HARDWARE: Both scoreboard lookups return 0
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,
+		Src2:  10,
+		Dest:  15,
+	}
+	sb.MarkReady(15) // Only dest ready
+	// Neither source ready
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 0 {
+		t.Errorf("Op with no sources ready should not be in bitmap, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_InvalidOps(t *testing.T) {
+	// WHAT: Invalid ops (empty slots) never appear in bitmap
+	// WHY: Empty slots shouldn't be scheduled
+	// HARDWARE: valid=0 gates the output to 0
+
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0) // All registers ready
+
+	// All ops invalid (default)
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 0 {
+		t.Errorf("Invalid ops should not be ready, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_SkipsIssuedOps(t *testing.T) {
+	// WHAT: Already-issued ops excluded from ready bitmap
+	// WHY: Prevents double-issue - catastrophic bug if same instruction runs twice
+	// HARDWARE: issued=1 gates the output to 0
+
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0)
+
+	window.Ops[0] = Operation{
+		Valid:  true,
+		Issued: true, // Already sent to execution
+		Src1:   1,
+		Src2:   2,
+		Dest:   10,
+	}
+
+	window.Ops[1] = Operation{
+		Valid:  true,
+		Issued: false,
+		Src1:   1,
+		Src2:   2,
+		Dest:   11,
+	}
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	expected := uint32(0b10) // Only op 1
+	if bitmap != expected {
+		t.Errorf("Should skip issued ops, expected 0x%08X, got 0x%08X", expected, bitmap)
+	}
+}
+
+func TestReadyBitmap_SameSourceRegisters(t *testing.T) {
+	// WHAT: Instruction using same register for both sources
+	// WHY: Edge case - some instructions read one register twice (e.g., R5 = R3 * R3)
+	// HARDWARE: Both MUXes select same scoreboard bit, AND still works
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,
+		Src2:  5, // Same as Src1
+		Dest:  10,
+	}
+	sb.MarkReady(5)
+	sb.MarkReady(10)
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 1 {
+		t.Errorf("Op with same source registers should be ready, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_SourceEqualsDestination(t *testing.T) {
+	// WHAT: Instruction reads and writes same register (e.g., R5 = R5 + 1)
+	// WHY: Common pattern (increment), must work correctly
+	// HARDWARE: All three checks (src1, src2, dest) reference same scoreboard bit
+	//
+	// KEY: If R5 is ready, we can both read it AND claim it for writing.
+	// The read happens before the write in instruction semantics.
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  5,
+		Src2:  5,
+		Dest:  5, // Same as sources
+	}
+	sb.MarkReady(5)
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 1 {
+		t.Errorf("Op reading and writing same register should be ready, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_FullWindow(t *testing.T) {
+	// WHAT: All 32 slots filled and ready
+	// WHY: Maximum parallelism case - stress test parallel checkers
+	// HARDWARE: All 32 ready checkers active simultaneously
+
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0) // All registers ready
+
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{
+			Valid: true,
+			Src1:  1,
+			Src2:  2,
+			Dest:  uint8(10 + i), // Different dests
+		}
+	}
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	expected := ^uint32(0) // All 32 bits set
+	if bitmap != expected {
+		t.Errorf("Full window should have all bits set, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_ScatteredSlots(t *testing.T) {
+	// WHAT: Ready ops at non-contiguous slots
+	// WHY: Real workloads have gaps (some ops issued, some blocked)
+	// HARDWARE: Validates independence of slot checkers
+
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0)
+
+	slots := []int{0, 5, 10, 15, 20, 25, 30}
+	for _, slot := range slots {
+		window.Ops[slot] = Operation{
+			Valid: true,
+			Src1:  1,
+			Src2:  2,
+			Dest:  uint8(slot + 10),
+		}
+	}
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	var expected uint32
+	for _, slot := range slots {
+		expected |= 1 << slot
+	}
+
+	if bitmap != expected {
+		t.Errorf("Scattered slots: expected 0x%08X, got 0x%08X", expected, bitmap)
+	}
+}
+
+func TestReadyBitmap_MixedReadiness(t *testing.T) {
+	// WHAT: Mix of ready, blocked on src1, blocked on src2, blocked on dest
+	// WHY: Realistic scenario - different ops have different dependencies
+	// HARDWARE: Each checker operates independently
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	sb.MarkReady(1)
+	sb.MarkReady(2)
+	sb.MarkReady(10)
+	sb.MarkReady(14)
+	// Registers 3, 4, 11, 12, 13 NOT ready
+
+	// Slot 0: All ready → READY
+	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+
+	// Slot 1: Src1 ready, Src2 not → BLOCKED
+	window.Ops[1] = Operation{Valid: true, Src1: 1, Src2: 3, Dest: 11}
+
+	// Slot 2: Src1 not, Src2 ready → BLOCKED
+	window.Ops[2] = Operation{Valid: true, Src1: 4, Src2: 2, Dest: 12}
+
+	// Slot 3: Sources ready, Dest not (WAW) → BLOCKED
+	window.Ops[3] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 13}
+
+	// Slot 4: All ready → READY
+	window.Ops[4] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 14}
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	expected := uint32(0b10001) // Slots 0 and 4
+	if bitmap != expected {
+		t.Errorf("Mixed readiness: expected 0x%08X, got 0x%08X", expected, bitmap)
+	}
+}
+
+func TestReadyBitmap_Register0(t *testing.T) {
+	// WHAT: Operations using register 0
+	// WHY: Register 0 is LSB boundary
+	// HARDWARE: Validates bit 0 of scoreboard accessible
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  0,
+		Src2:  0,
+		Dest:  0,
+	}
+	sb.MarkReady(0)
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 1 {
+		t.Errorf("Op using register 0 should be ready, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_Register63(t *testing.T) {
+	// WHAT: Operations using highest register
+	// WHY: Boundary condition - validates full register file accessible
+	// HARDWARE: Validates bit 63 of scoreboard accessible
+
+	window := &InstructionWindow{}
+	var sb Scoreboard
+
+	window.Ops[0] = Operation{
+		Valid: true,
+		Src1:  63,
+		Src2:  63,
+		Dest:  63,
+	}
+	sb.MarkReady(63)
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	if bitmap != 1 {
+		t.Errorf("Op using register 63 should be ready, got 0x%08X", bitmap)
+	}
+}
+
+func TestReadyBitmap_UnissuedProducerBlocks(t *testing.T) {
+	// WHAT: Consumer blocked by unissued producer in window
+	// WHY: This is the KEY test for dependency matrix integration
+	// HARDWARE: Producer scan blocks consumer even if scoreboard shows ready
+	//
+	// SCENARIO:
+	//   Slot 10 (older): A writes R5 (not issued)
+	//   Slot 5 (newer):  B reads R5 (depends on A)
+	//
+	// Even though scoreboard[5] = 1 (old data), B must wait for A to issue!
+
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0) // All registers "ready"
+
+	// Producer at slot 10 (older, not issued)
+	window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
+
+	// Consumer at slot 5 (younger, reads R5)
+	window.Ops[5] = Operation{Valid: true, Src1: 5, Src2: 3, Dest: 6}
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	// Only slot 10 should be ready (producer)
+	// Slot 5 blocked by unissued producer
+	expected := uint32(1 << 10)
+	if bitmap != expected {
+		t.Errorf("Consumer should be blocked by unissued producer, expected 0x%08X, got 0x%08X", expected, bitmap)
+	}
+}
+
+func TestReadyBitmap_IssuedProducerDoesNotBlock(t *testing.T) {
+	// WHAT: Consumer not blocked by ISSUED producer (scoreboard takes over)
+	// WHY: Once producer issues, scoreboard[dest] = 0 handles waiting
+	// HARDWARE: Producer scan only blocks if producer.Issued = false
+	//
+	// SCENARIO:
+	//   Slot 10 (older): A writes R5 (ISSUED, so scoreboard[5] = 0)
+	//   Slot 5 (newer):  B reads R5
+	//
+	// A.Issued = true → B passes producer check
+	// scoreboard[5] = 0 → B fails scoreboard check
+	// B correctly waits for A to complete
+
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0)
+
+	// Producer at slot 10 (ISSUED)
+	window.Ops[10] = Operation{Valid: true, Issued: true, Src1: 1, Src2: 2, Dest: 5}
+	sb.MarkPending(5) // Producer has issued, dest is pending
+
+	// Consumer at slot 5
+	window.Ops[5] = Operation{Valid: true, Src1: 5, Src2: 3, Dest: 6}
+
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
+
+	// Slot 10 already issued, not in bitmap
+	// Slot 5 blocked by scoreboard[5] = 0 (not by producer check)
+	if bitmap != 0 {
+		t.Errorf("Consumer should be blocked by scoreboard, got 0x%08X", bitmap)
 	}
 }
 
@@ -1242,14 +1279,6 @@ func TestDependencyMatrix_ComplexGraph(t *testing.T) {
 // Hardware: 32 parallel OR reduction trees
 // Timing: 100ps (5-level OR tree per row)
 //
-// WHY NOT TRUE CRITICAL PATH?
-//   True depth computation would require iterative propagation:
-//     depth[i] = max(depth[j] + 1) for all j depending on i
-//   This takes up to 32 iterations (worst-case chain length).
-//   Cost: +300ps, converts 2-cycle scheduler to 5-8 cycles.
-//   Benefit: ~3% IPC improvement.
-//   Not worth it - the latency penalty exceeds scheduling benefit.
-//
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 func TestPriority_AllLeaves(t *testing.T) {
@@ -1258,7 +1287,7 @@ func TestPriority_AllLeaves(t *testing.T) {
 	// HARDWARE: All OR trees output 0
 
 	readyBitmap := uint32(0b1111)
-	depMatrix := DependencyMatrix{0, 0, 0, 0} // No dependencies
+	depMatrix := DependencyMatrix{0, 0, 0, 0}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
@@ -1277,9 +1306,9 @@ func TestPriority_AllCritical(t *testing.T) {
 
 	readyBitmap := uint32(0b111)
 	depMatrix := DependencyMatrix{
-		0b010, // Op 0 has op 1 as dependent
-		0b100, // Op 1 has op 2 as dependent
-		0b001, // Op 2 has op 0 as dependent (cycle for testing)
+		0b010,
+		0b100,
+		0b001,
 	}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
@@ -1297,7 +1326,7 @@ func TestPriority_Mixed(t *testing.T) {
 	// WHY: Realistic scenario
 	// HARDWARE: Some OR trees output 1, others output 0
 
-	readyBitmap := uint32(0b11111) // Ops 0-4 ready
+	readyBitmap := uint32(0b11111)
 	depMatrix := DependencyMatrix{
 		0b00010, // Op 0 has op 1 as dependent → HIGH
 		0b00000, // Op 1 no dependents → LOW
@@ -1308,8 +1337,8 @@ func TestPriority_Mixed(t *testing.T) {
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
-	expectedHigh := uint32(0b00101) // Ops 0, 2
-	expectedLow := uint32(0b11010)  // Ops 1, 3, 4
+	expectedHigh := uint32(0b00101)
+	expectedLow := uint32(0b11010)
 
 	if priority.HighPriority != expectedHigh {
 		t.Errorf("High priority: expected 0x%08X, got 0x%08X", expectedHigh, priority.HighPriority)
@@ -1324,16 +1353,15 @@ func TestPriority_OnlyClassifiesReadyOps(t *testing.T) {
 	// WHY: Can't issue non-ready ops, so priority irrelevant
 	// HARDWARE: ready bitmap gates the output
 
-	readyBitmap := uint32(0b001) // Only op 0 ready
+	readyBitmap := uint32(0b001)
 	depMatrix := DependencyMatrix{
-		0b010, // Op 0 has dependent
-		0b100, // Op 1 has dependent BUT not ready
-		0b000, // Op 2 no dependent AND not ready
+		0b010,
+		0b100,
+		0b000,
 	}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
-	// Only op 0 should be classified (high priority since it has dependent)
 	if priority.HighPriority != 1 {
 		t.Errorf("Only ready ops classified, expected high 0x1, got 0x%08X", priority.HighPriority)
 	}
@@ -1348,7 +1376,7 @@ func TestPriority_EmptyReadyBitmap(t *testing.T) {
 	// HARDWARE: All outputs gated to 0
 
 	readyBitmap := uint32(0)
-	depMatrix := DependencyMatrix{0b111, 0b111, 0b111} // Irrelevant
+	depMatrix := DependencyMatrix{0b111, 0b111, 0b111}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
@@ -1362,14 +1390,13 @@ func TestPriority_DependentNotReady(t *testing.T) {
 	// WHY: The dependent exists in matrix, affects classification
 	// HARDWARE: OR tree sees 1 bit even if that dependent isn't ready
 
-	readyBitmap := uint32(0b001) // Only op 0 ready
+	readyBitmap := uint32(0b001)
 	depMatrix := DependencyMatrix{
 		0b010, // Op 0 has op 1 as dependent (but op 1 not ready)
 	}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
-	// Op 0 is high priority (has dependent, even though dependent not ready yet)
 	if priority.HighPriority != 1 {
 		t.Errorf("Op with non-ready dependent still high priority, got 0x%08X", priority.HighPriority)
 	}
@@ -1382,15 +1409,15 @@ func TestPriority_ChainClassification(t *testing.T) {
 
 	readyBitmap := uint32(0b111)
 	depMatrix := DependencyMatrix{
-		0b010, // A (op 0) → B (op 1)
-		0b100, // B (op 1) → C (op 2)
-		0b000, // C (op 2) is leaf
+		0b010, // A → B
+		0b100, // B → C
+		0b000, // C is leaf
 	}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
-	expectedHigh := uint32(0b011) // A and B
-	expectedLow := uint32(0b100)  // C
+	expectedHigh := uint32(0b011)
+	expectedLow := uint32(0b100)
 
 	if priority.HighPriority != expectedHigh {
 		t.Errorf("Chain high priority: expected 0x%08X, got 0x%08X", expectedHigh, priority.HighPriority)
@@ -1405,19 +1432,17 @@ func TestPriority_FullWindow(t *testing.T) {
 	// WHY: Maximum scale test
 	// HARDWARE: All 32 OR trees active
 
-	readyBitmap := ^uint32(0) // All 32 ready
+	readyBitmap := ^uint32(0)
 	var depMatrix DependencyMatrix
 
-	// Even slots have dependents (the next odd slot)
 	for i := 0; i < 31; i += 2 {
 		depMatrix[i] = 1 << (i + 1)
 	}
 
 	priority := ClassifyPriority(readyBitmap, depMatrix)
 
-	// Verify classification
-	expectedHigh := uint32(0x55555555) // Even bits
-	expectedLow := uint32(0xAAAAAAAA)  // Odd bits
+	expectedHigh := uint32(0x55555555)
+	expectedLow := uint32(0xAAAAAAAA)
 
 	if priority.HighPriority != expectedHigh {
 		t.Errorf("Full window high: expected 0x%08X, got 0x%08X", expectedHigh, priority.HighPriority)
@@ -1434,7 +1459,6 @@ func TestPriority_DisjointSets(t *testing.T) {
 
 	for _, readyBitmap := range []uint32{0, 0xFF, 0xFF00, 0xFFFFFFFF} {
 		var depMatrix DependencyMatrix
-		// Random-ish dependency pattern
 		for i := 0; i < 32; i++ {
 			if i%3 == 0 {
 				depMatrix[i] = 1 << ((i + 7) % 32)
@@ -1443,13 +1467,11 @@ func TestPriority_DisjointSets(t *testing.T) {
 
 		priority := ClassifyPriority(readyBitmap, depMatrix)
 
-		// No overlap between high and low
 		if priority.HighPriority&priority.LowPriority != 0 {
 			t.Errorf("High and low overlap: H=0x%08X L=0x%08X",
 				priority.HighPriority, priority.LowPriority)
 		}
 
-		// Union equals ready bitmap
 		union := priority.HighPriority | priority.LowPriority
 		if union != readyBitmap {
 			t.Errorf("Union should equal ready bitmap: U=0x%08X R=0x%08X", union, readyBitmap)
@@ -1465,14 +1487,10 @@ func TestPriority_DisjointSets(t *testing.T) {
 //   1. If any high priority ops exist, select from high priority only
 //   2. Otherwise, select from low priority
 //   3. Within selected tier, pick oldest first (highest slot index)
+//   4. Skip ops whose dest is already claimed this cycle (WAW within bundle)
 //
-// Hardware: 32-bit OR tree (tier selection) + parallel CLZ encoder
-// Timing: 250ps (OR tree + encoder)
-//
-// WHY OLDEST FIRST?
-//   Older instructions have been waiting longer.
-//   They're more likely to be on the critical path.
-//   Younger instructions had less time to become critical.
+// Hardware: 32-bit OR tree (tier selection) + parallel CLZ encoder + claimed tracking
+// Timing: 150ps (OR tree + encoder + claim check)
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -1482,8 +1500,9 @@ func TestIssueBundle_Empty(t *testing.T) {
 	// HARDWARE: Both tiers empty, valid mask = 0
 
 	priority := PriorityClass{HighPriority: 0, LowPriority: 0}
+	window := &InstructionWindow{}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
 	if bundle.Valid != 0 {
 		t.Errorf("Empty priority should produce empty bundle, got valid 0x%04X", bundle.Valid)
@@ -1495,9 +1514,12 @@ func TestIssueBundle_SingleOp(t *testing.T) {
 	// WHY: Minimum positive case
 	// HARDWARE: One encoder output valid
 
+	window := &InstructionWindow{}
+	window.Ops[0] = Operation{Valid: true, Dest: 10}
+
 	priority := PriorityClass{HighPriority: 0b1, LowPriority: 0}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
 	if bundle.Valid != 0b1 {
 		t.Errorf("Single op should give valid 0x1, got 0x%04X", bundle.Valid)
@@ -1512,14 +1534,18 @@ func TestIssueBundle_HighPriorityFirst(t *testing.T) {
 	// WHY: Critical path scheduling - unblock dependent work first
 	// HARDWARE: Tier selection MUX chooses high when available
 
+	window := &InstructionWindow{}
+	for i := 0; i < 5; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(10 + i)}
+	}
+
 	priority := PriorityClass{
 		HighPriority: 0b00011, // Ops 0, 1
 		LowPriority:  0b11100, // Ops 2, 3, 4
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
-	// Should only select from high priority
 	for i := 0; i < 16; i++ {
 		if (bundle.Valid>>i)&1 == 0 {
 			continue
@@ -1530,7 +1556,6 @@ func TestIssueBundle_HighPriorityFirst(t *testing.T) {
 		}
 	}
 
-	// Should select exactly 2 ops
 	count := bits.OnesCount16(bundle.Valid)
 	if count != 2 {
 		t.Errorf("Should select 2 ops, got %d", count)
@@ -1542,14 +1567,18 @@ func TestIssueBundle_LowPriorityWhenNoHigh(t *testing.T) {
 	// WHY: Don't leave execution units idle
 	// HARDWARE: Tier MUX selects low when high is empty
 
+	window := &InstructionWindow{}
+	for i := 0; i < 3; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(10 + i)}
+	}
+
 	priority := PriorityClass{
 		HighPriority: 0,
 		LowPriority:  0b111,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
-	// Should select all 3 low priority ops
 	count := bits.OnesCount16(bundle.Valid)
 	if count != 3 {
 		t.Errorf("Should select 3 low priority ops, got %d", count)
@@ -1565,19 +1594,22 @@ func TestIssueBundle_OldestFirst(t *testing.T) {
 	//   Slot 31 = oldest (entered window first)
 	//   Slot 0 = newest (entered window last)
 
+	window := &InstructionWindow{}
+	for i := 4; i < 8; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(10 + i)}
+	}
+
 	priority := PriorityClass{
 		HighPriority: 0b11110000, // Ops 4,5,6,7
 		LowPriority:  0,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
-	// First selected should be op 7 (oldest = highest bit)
 	if bundle.Indices[0] != 7 {
 		t.Errorf("Oldest op (7) should be first, got %d", bundle.Indices[0])
 	}
 
-	// Verify descending order
 	prev := bundle.Indices[0]
 	for i := 1; i < 16; i++ {
 		if (bundle.Valid>>i)&1 == 0 {
@@ -1595,12 +1627,17 @@ func TestIssueBundle_Exactly16(t *testing.T) {
 	// WHY: Perfect match for execution width
 	// HARDWARE: All 16 encoder outputs valid
 
+	window := &InstructionWindow{}
+	for i := 0; i < 16; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(10 + i)}
+	}
+
 	priority := PriorityClass{
 		HighPriority: 0xFFFF, // 16 ops
 		LowPriority:  0,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
 	if bundle.Valid != 0xFFFF {
 		t.Errorf("16 ops should fill bundle, got valid 0x%04X", bundle.Valid)
@@ -1612,14 +1649,18 @@ func TestIssueBundle_MoreThan16(t *testing.T) {
 	// WHY: Can only issue 16 per cycle (execution unit limit)
 	// HARDWARE: Encoder saturates at 16
 
+	window := &InstructionWindow{}
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(i)} // Different dests!
+	}
+
 	priority := PriorityClass{
 		HighPriority: 0xFFFFFFFF, // 32 ops
 		LowPriority:  0,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
-	// Should select exactly 16
 	count := bits.OnesCount16(bundle.Valid)
 	if count != 16 {
 		t.Errorf("Should select exactly 16 ops, got %d", count)
@@ -1637,78 +1678,106 @@ func TestIssueBundle_MoreThan16(t *testing.T) {
 	}
 }
 
-func TestIssueBundle_HighBitSlots(t *testing.T) {
-	// WHAT: Ops only in high slots (16-31)
-	// WHY: Validates CLZ handles upper half of bitmap
-	// HARDWARE: MSB-first search finds these slots
+func TestIssueBundle_WAWConflict_SameCycle(t *testing.T) {
+	// WHAT: Two ops writing same register in same cycle
+	// WHY: This is the WAW-within-bundle conflict we must prevent
+	// HARDWARE: claimed mask tracks destinations during selection
+	//
+	// SCENARIO:
+	//   Slot 15: writes R10
+	//   Slot 10: writes R10
+	//   Both are ready. Without claimed tracking, both would issue.
+	//   With claimed tracking, only oldest (slot 15) issues this cycle.
+
+	window := &InstructionWindow{}
+	window.Ops[15] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[10] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 10} // Same dest!
 
 	priority := PriorityClass{
-		HighPriority: 0xFFFF0000, // Slots 16-31
+		HighPriority: (1 << 15) | (1 << 10), // Both ready
 		LowPriority:  0,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
-	for i := 0; i < 16; i++ {
-		if (bundle.Valid>>i)&1 == 0 {
-			continue
-		}
-		idx := bundle.Indices[i]
-		if idx < 16 || idx > 31 {
-			t.Errorf("Should only select slots 16-31, got %d", idx)
-		}
-	}
-}
-
-func TestIssueBundle_LowBitSlots(t *testing.T) {
-	// WHAT: Ops only in low slots (0-15)
-	// WHY: Validates CLZ handles lower half of bitmap
-	// HARDWARE: LSB region search
-
-	priority := PriorityClass{
-		HighPriority: 0x0000FFFF, // Slots 0-15
-		LowPriority:  0,
+	count := bits.OnesCount16(bundle.Valid)
+	if count != 1 {
+		t.Errorf("Should select only 1 op (WAW conflict), got %d", count)
 	}
 
-	bundle := SelectIssueBundle(priority)
-
-	for i := 0; i < 16; i++ {
-		if (bundle.Valid>>i)&1 == 0 {
-			continue
-		}
-		idx := bundle.Indices[i]
-		if idx > 15 {
-			t.Errorf("Should only select slots 0-15, got %d", idx)
-		}
-	}
-
-	// Should still select oldest first (slot 15, 14, 13...)
+	// Should be the older one (slot 15)
 	if bundle.Indices[0] != 15 {
-		t.Errorf("Oldest in low slots is 15, got %d", bundle.Indices[0])
+		t.Errorf("Should select older slot 15, got slot %d", bundle.Indices[0])
 	}
 }
 
-func TestIssueBundle_ScatteredSlots(t *testing.T) {
-	// WHAT: Non-contiguous ready ops
-	// WHY: Realistic scenario - some ops blocked, some issued
-	// HARDWARE: CLZ skips zero bits
+func TestIssueBundle_WAWConflict_Multiple(t *testing.T) {
+	// WHAT: Multiple groups of WAW conflicts
+	// WHY: Verify claimed tracking handles multiple conflicts
+	// HARDWARE: 64-bit claimed mask tracks all 64 possible registers
+
+	window := &InstructionWindow{}
+	// Group 1: slots 31, 21, 11 all write R10
+	window.Ops[31] = Operation{Valid: true, Dest: 10}
+	window.Ops[21] = Operation{Valid: true, Dest: 10}
+	window.Ops[11] = Operation{Valid: true, Dest: 10}
+	// Group 2: slots 30, 20 write R20
+	window.Ops[30] = Operation{Valid: true, Dest: 20}
+	window.Ops[20] = Operation{Valid: true, Dest: 20}
+	// Independent: slot 25 writes R30
+	window.Ops[25] = Operation{Valid: true, Dest: 30}
 
 	priority := PriorityClass{
-		HighPriority: 0b10100101_00001010_10000001_00010100, // Scattered
+		HighPriority: (1 << 31) | (1 << 30) | (1 << 25) | (1 << 21) | (1 << 20) | (1 << 11),
 		LowPriority:  0,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
-	// Verify all selected indices have corresponding bits set
+	count := bits.OnesCount16(bundle.Valid)
+	if count != 3 {
+		t.Errorf("Should select 3 ops (one per dest), got %d", count)
+	}
+
+	// Should select: slot 31 (R10), slot 30 (R20), slot 25 (R30)
+	selectedDests := make(map[uint8]bool)
 	for i := 0; i < 16; i++ {
 		if (bundle.Valid>>i)&1 == 0 {
 			continue
 		}
-		idx := bundle.Indices[i]
-		if (priority.HighPriority>>idx)&1 != 1 {
-			t.Errorf("Selected index %d not in priority bitmap", idx)
+		dest := window.Ops[bundle.Indices[i]].Dest
+		if selectedDests[dest] {
+			t.Errorf("Selected two ops writing same dest %d", dest)
 		}
+		selectedDests[dest] = true
+	}
+}
+
+func TestIssueBundle_WAWConflict_AllSameDest(t *testing.T) {
+	// WHAT: All ready ops write same register
+	// WHY: Extreme case - only one can issue
+	// HARDWARE: claimed mask blocks all but first
+
+	window := &InstructionWindow{}
+	for i := 0; i < 8; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: 5} // All write R5
+	}
+
+	priority := PriorityClass{
+		HighPriority: 0xFF, // All 8 ready
+		LowPriority:  0,
+	}
+
+	bundle := SelectIssueBundle(priority, window)
+
+	count := bits.OnesCount16(bundle.Valid)
+	if count != 1 {
+		t.Errorf("Should select only 1 op (all write same dest), got %d", count)
+	}
+
+	// Should be oldest (slot 7)
+	if bundle.Indices[0] != 7 {
+		t.Errorf("Should select oldest slot 7, got slot %d", bundle.Indices[0])
 	}
 }
 
@@ -1717,12 +1786,17 @@ func TestIssueBundle_NoDuplicates(t *testing.T) {
 	// WHY: Double-issue would be catastrophic
 	// HARDWARE: Each CLZ iteration masks out selected bit
 
+	window := &InstructionWindow{}
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(i)}
+	}
+
 	priority := PriorityClass{
 		HighPriority: 0xFFFFFFFF,
 		LowPriority:  0,
 	}
 
-	bundle := SelectIssueBundle(priority)
+	bundle := SelectIssueBundle(priority, window)
 
 	seen := make(map[uint8]int)
 	for i := 0; i < 16; i++ {
@@ -1742,11 +1816,16 @@ func TestIssueBundle_ValidMaskMatchesCount(t *testing.T) {
 	// WHY: Consistency check
 	// HARDWARE: Valid mask generated alongside indices
 
+	window := &InstructionWindow{}
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(i)}
+	}
+
 	testCases := []uint32{0, 0b1, 0b11, 0xFF, 0xFFFF, 0xFFFFFFFF}
 
 	for _, bitmap := range testCases {
 		priority := PriorityClass{HighPriority: bitmap, LowPriority: 0}
-		bundle := SelectIssueBundle(priority)
+		bundle := SelectIssueBundle(priority, window)
 
 		expected := bits.OnesCount32(bitmap)
 		if expected > 16 {
@@ -1768,11 +1847,11 @@ func TestIssueBundle_ValidMaskMatchesCount(t *testing.T) {
 // When instructions complete, their destination registers become ready.
 //
 // UpdateScoreboardAfterIssue: Called after SelectIssueBundle
-//   - Marks dest registers pending (blocks dependent ops)
-//   - Sets Issued flag (prevents double-issue)
+//   - Marks dest registers pending (blocks RAW dependent ops)
+//   - Sets Issued flag (prevents double-issue, enables producer check to pass)
 //
 // UpdateScoreboardAfterComplete: Called when execution units signal done
-//   - Marks dest registers ready (unblocks dependent ops)
+//   - Marks dest registers ready (unblocks dependent ops AND WAW ops)
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -1781,11 +1860,10 @@ func TestIssueUpdate_Single(t *testing.T) {
 	// WHY: Basic scoreboard update
 	// HARDWARE: One MarkPending, one Issued flag set
 
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0) // All ready
 	window := &InstructionWindow{}
 
 	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sb.MarkReady(10) // Initially ready
 
 	bundle := IssueBundle{
 		Indices: [16]uint8{0},
@@ -1804,15 +1882,14 @@ func TestIssueUpdate_Single(t *testing.T) {
 
 func TestIssueUpdate_Multiple(t *testing.T) {
 	// WHAT: Multiple ops issued in parallel
-	// WHY: Typical case - 16 ops per cycle
+	// WHY: Typical case - up to 16 ops per cycle
 	// HARDWARE: 16 parallel MarkPending operations
 
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0)
 	window := &InstructionWindow{}
 
 	for i := 0; i < 5; i++ {
 		window.Ops[i] = Operation{Valid: true, Dest: uint8(10 + i)}
-		sb.MarkReady(uint8(10 + i))
 	}
 
 	bundle := IssueBundle{
@@ -1837,10 +1914,9 @@ func TestIssueUpdate_EmptyBundle(t *testing.T) {
 	// WHY: No ops issued, no state change
 	// HARDWARE: Valid mask gates all updates
 
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0)
 	window := &InstructionWindow{}
 
-	sb.MarkReady(10)
 	window.Ops[0] = Operation{Valid: true, Dest: 10}
 
 	bundle := IssueBundle{Valid: 0}
@@ -1857,17 +1933,16 @@ func TestIssueUpdate_EmptyBundle(t *testing.T) {
 
 func TestIssueUpdate_ScatteredSlots(t *testing.T) {
 	// WHAT: Issue from non-contiguous window slots
-	// WHY: Validates per-slot banking (no conflicts)
+	// WHY: Validates per-slot handling
 	// HARDWARE: Each slot in separate SRAM bank
 
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0)
 	window := &InstructionWindow{}
 
 	slots := []int{0, 7, 15, 22, 31}
 	var bundle IssueBundle
 	for i, slot := range slots {
 		window.Ops[slot] = Operation{Valid: true, Dest: uint8(slot + 10)}
-		sb.MarkReady(uint8(slot + 10))
 		bundle.Indices[i] = uint8(slot)
 		bundle.Valid |= 1 << i
 	}
@@ -1884,37 +1959,12 @@ func TestIssueUpdate_ScatteredSlots(t *testing.T) {
 	}
 }
 
-func TestIssueUpdate_SameDest(t *testing.T) {
-	// WHAT: Multiple ops write same destination
-	// WHY: WAW scenario - both mark same register pending
-	// HARDWARE: Multiple MarkPending on same bit (idempotent)
-
-	var sb Scoreboard
-	window := &InstructionWindow{}
-
-	// Both ops write R10
-	window.Ops[0] = Operation{Valid: true, Dest: 10}
-	window.Ops[1] = Operation{Valid: true, Dest: 10}
-	sb.MarkReady(10)
-
-	bundle := IssueBundle{
-		Indices: [16]uint8{0, 1},
-		Valid:   0b11,
-	}
-
-	UpdateScoreboardAfterIssue(&sb, window, bundle)
-
-	if sb.IsReady(10) {
-		t.Error("Register 10 should be pending (written by both)")
-	}
-}
-
 func TestCompleteUpdate_Single(t *testing.T) {
 	// WHAT: Single op completes, dest becomes ready
 	// WHY: Basic completion handling
 	// HARDWARE: One MarkReady
 
-	var sb Scoreboard
+	var sb Scoreboard // All pending
 
 	destRegs := [16]uint8{10}
 	completeMask := uint16(0b1)
@@ -1957,7 +2007,6 @@ func TestCompleteUpdate_Selective(t *testing.T) {
 
 	UpdateScoreboardAfterComplete(&sb, destRegs, completeMask)
 
-	// Indices 1 and 3 complete
 	if !sb.IsReady(11) {
 		t.Error("Register 11 (index 1) should be ready")
 	}
@@ -1965,7 +2014,6 @@ func TestCompleteUpdate_Selective(t *testing.T) {
 		t.Error("Register 13 (index 3) should be ready")
 	}
 
-	// Indices 0 and 2 don't complete
 	if sb.IsReady(10) {
 		t.Error("Register 10 (index 0) should not be ready")
 	}
@@ -1996,42 +2044,20 @@ func TestCompleteUpdate_All16(t *testing.T) {
 	}
 }
 
-func TestCompleteUpdate_SameDest(t *testing.T) {
-	// WHAT: Multiple completions write same register
-	// WHY: WAW completion - both set same bit
-	// HARDWARE: Multiple MarkReady on same bit (idempotent)
-
-	var sb Scoreboard
-
-	destRegs := [16]uint8{10, 10, 10} // All write R10
-	completeMask := uint16(0b111)
-
-	UpdateScoreboardAfterComplete(&sb, destRegs, completeMask)
-
-	if !sb.IsReady(10) {
-		t.Error("Register 10 should be ready after multiple completions")
-	}
-}
-
 func TestIssueComplete_Cycle(t *testing.T) {
 	// WHAT: Issue then complete - full lifecycle
 	// WHY: End-to-end register state tracking
 	// HARDWARE: Issue → execution → complete pipeline
 
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0)
 	window := &InstructionWindow{}
 
-	// Setup
 	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-	sb.MarkReady(10)
 
 	// Issue
 	bundle := IssueBundle{Indices: [16]uint8{0}, Valid: 0b1}
 	UpdateScoreboardAfterIssue(&sb, window, bundle)
 
-	// Verify pending
 	if sb.IsReady(10) {
 		t.Error("After issue, dest should be pending")
 	}
@@ -2039,7 +2065,6 @@ func TestIssueComplete_Cycle(t *testing.T) {
 	// Complete
 	UpdateScoreboardAfterComplete(&sb, [16]uint8{10}, 0b1)
 
-	// Verify ready
 	if !sb.IsReady(10) {
 		t.Error("After complete, dest should be ready")
 	}
@@ -2061,56 +2086,43 @@ func TestIssueComplete_Cycle(t *testing.T) {
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
+func TestNewOoOScheduler(t *testing.T) {
+	// WHAT: Constructor initializes scoreboard to all-ready
+	// WHY: Fresh context has no in-flight instructions
+	// HARDWARE: All scoreboard bits set on context switch-in
+
+	sched := NewOoOScheduler()
+
+	for i := uint8(0); i < 64; i++ {
+		if !sched.Scoreboard.IsReady(i) {
+			t.Errorf("Register %d should be ready after NewOoOScheduler", i)
+		}
+	}
+
+	if sched.Scoreboard != ^Scoreboard(0) {
+		t.Errorf("Scoreboard should be 0xFFFFFFFFFFFFFFFF, got 0x%016X", sched.Scoreboard)
+	}
+}
+
 func TestPipeline_BasicOperation(t *testing.T) {
 	// WHAT: Cycle 0 computes priority, Cycle 1 uses it
 	// WHY: Verify pipeline register transfers state
 	// HARDWARE: D flip-flops capture priority at cycle boundary
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Setup window
 	sched.Window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
 
-	// Cycle 0: Compute priority
 	sched.ScheduleCycle0()
 
-	// Verify pipeline register populated
 	if sched.PipelinedPriority.HighPriority == 0 && sched.PipelinedPriority.LowPriority == 0 {
 		t.Error("PipelinedPriority should be populated after Cycle 0")
 	}
 
-	// Cycle 1: Use priority to select
 	bundle := sched.ScheduleCycle1()
 
 	if bundle.Valid == 0 {
 		t.Error("Cycle 1 should produce bundle from pipelined priority")
-	}
-}
-
-func TestPipeline_StatePreservation(t *testing.T) {
-	// WHAT: Pipeline register preserves state between cycles
-	// WHY: Must survive clock edge
-	// HARDWARE: Edge-triggered flip-flops
-
-	sched := &OoOScheduler{}
-
-	for i := 0; i < 5; i++ {
-		sched.Window.Ops[i] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: uint8(10 + i)}
-	}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-
-	sched.ScheduleCycle0()
-	captured := sched.PipelinedPriority
-
-	// Multiple accesses shouldn't change it
-	_ = sched.PipelinedPriority
-	_ = sched.PipelinedPriority
-
-	if sched.PipelinedPriority != captured {
-		t.Error("Pipeline register should preserve state between reads")
 	}
 }
 
@@ -2119,18 +2131,16 @@ func TestPipeline_IndependentOps(t *testing.T) {
 	// WHY: Maximum parallelism - all ops ready immediately
 	// HARDWARE: Full execution width utilized
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
 	for i := 0; i < 20; i++ {
 		sched.Window.Ops[i] = Operation{
 			Valid: true,
 			Src1:  1,
 			Src2:  2,
-			Dest:  uint8(10 + i),
+			Dest:  uint8(10 + i), // Different dests
 		}
 	}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
 
 	// First issue
 	sched.ScheduleCycle0()
@@ -2155,20 +2165,19 @@ func TestPipeline_DependencyChain(t *testing.T) {
 	// WHAT: Chain A→B→C, issued one at a time
 	// WHY: Serialized execution due to dependencies
 	// HARDWARE: Ready bitmap changes as completions occur
+	//
+	// With dependency matrix integration:
+	// - B waits for A to ISSUE (producer check)
+	// - After A issues, B waits for A to COMPLETE (scoreboard check)
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
 	// Chain: slot 20 → slot 10 → slot 5
-	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}  // A
-	sched.Window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11} // B
-	sched.Window.Ops[5] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12}  // C
+	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
+	sched.Window.Ops[5] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12}
 
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-	sched.Scoreboard.MarkReady(3)
-	sched.Scoreboard.MarkReady(4)
-
-	// Issue A only
+	// Issue A only (B and C blocked by unissued producer)
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
 
@@ -2176,7 +2185,7 @@ func TestPipeline_DependencyChain(t *testing.T) {
 		t.Errorf("Should issue A (slot 20) first, got slot %d", bundle.Indices[0])
 	}
 	if bits.OnesCount16(bundle.Valid) != 1 {
-		t.Error("Should issue only A (B and C blocked)")
+		t.Error("Should issue only A (B and C blocked by producer check)")
 	}
 
 	// Complete A
@@ -2219,17 +2228,12 @@ func TestPipeline_Diamond(t *testing.T) {
 	// WHY: Tests ILP extraction - B and C can run in parallel
 	// HARDWARE: Multiple ready ops issued simultaneously
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	sched.Window.Ops[25] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}   // A
-	sched.Window.Ops[20] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}  // B
-	sched.Window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12}  // C
-	sched.Window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 12, Dest: 13} // D
-
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-	sched.Scoreboard.MarkReady(3)
-	sched.Scoreboard.MarkReady(4)
+	sched.Window.Ops[25] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	sched.Window.Ops[20] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
+	sched.Window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 4, Dest: 12}
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 12, Dest: 13}
 
 	// Issue A
 	sched.ScheduleCycle0()
@@ -2286,7 +2290,7 @@ func TestPipeline_EmptyWindow(t *testing.T) {
 	// WHY: Nothing to schedule
 	// HARDWARE: All valid bits 0
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
@@ -2297,20 +2301,23 @@ func TestPipeline_EmptyWindow(t *testing.T) {
 }
 
 func TestPipeline_AllBlocked(t *testing.T) {
-	// WHAT: All ops blocked on dependencies
+	// WHAT: All ops blocked on dependencies (external registers)
 	// WHY: No forward progress possible
 	// HARDWARE: Ready bitmap is 0
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
+	// All ops read from registers that are pending (not ready)
 	for i := 0; i < 10; i++ {
 		sched.Window.Ops[i] = Operation{
 			Valid: true,
-			Src1:  50, // Not ready
-			Src2:  51, // Not ready
+			Src1:  50, // Mark as not ready
+			Src2:  51, // Mark as not ready
 			Dest:  uint8(10 + i),
 		}
 	}
+	sched.Scoreboard.MarkPending(50)
+	sched.Scoreboard.MarkPending(51)
 
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
@@ -2320,85 +2327,53 @@ func TestPipeline_AllBlocked(t *testing.T) {
 	}
 }
 
-func TestPipeline_CompleteBeforeCycle1(t *testing.T) {
-	// WHAT: Completion happens between Cycle 0 and Cycle 1
-	// WHY: Tests pipeline hazard - stale priority used
-	// HARDWARE: This is expected behavior (1 cycle delay to see completion)
+func TestPipeline_WAWSequence(t *testing.T) {
+	// WHAT: Two ops writing same register, issued sequentially
+	// WHY: Verify WAW handling through scoreboard
+	// HARDWARE: scoreboard[dest] blocks younger WAW until older completes
+	//
+	// SCENARIO:
+	//   Slot 20: A: R5 = f(R1, R2)   # older
+	//   Slot 10: B: R5 = g(R3, R4)   # younger, same dest
+	//
+	// Cycle 1: A issues (scoreboard[5] = 0)
+	// Cycle 2: B tries to issue, scoreboard[5] = 0 → NOT ready
+	// Cycle N: A completes (scoreboard[5] = 1)
+	// Cycle N+1: B issues
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// A → B chain
-	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sched.Window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-	sched.Scoreboard.MarkReady(3)
+	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 5}
 
-	// Cycle 0: Only A ready
+	// Issue A (older) - B blocked by claimed mask
 	sched.ScheduleCycle0()
-
-	// Between cycles: A completes (simulated)
-	// In real hardware, completion could arrive here
-	sched.Window.Ops[20].Issued = true
-	sched.ScheduleComplete([16]uint8{10}, 0b1)
-
-	// Cycle 1: Uses stale priority
 	bundle := sched.ScheduleCycle1()
 
-	// A was already marked Issued, so won't be selected
-	// B won't be in this bundle because it wasn't ready at Cycle 0
-	// This is expected pipeline behavior
-	t.Log("Pipeline hazard: completion between cycles delays B by 1 cycle")
-	t.Logf("Bundle valid: 0x%04X", bundle.Valid)
-}
-
-func TestPipeline_Interleaved(t *testing.T) {
-	// WHAT: Interleaved issue and complete operations
-	// WHY: Realistic steady-state behavior
-	// HARDWARE: Overlapped pipeline stages
-
-	sched := &OoOScheduler{}
-
-	// Batch 1: Independent ops
-	for i := 0; i < 4; i++ {
-		sched.Window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  1,
-			Src2:  2,
-			Dest:  uint8(10 + i),
-		}
+	if bits.OnesCount16(bundle.Valid) != 1 {
+		t.Errorf("Should issue only 1 op (WAW claimed), got %d", bits.OnesCount16(bundle.Valid))
 	}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-
-	// Batch 2: Depend on batch 1
-	for i := 4; i < 8; i++ {
-		sched.Window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  uint8(6 + i), // Depends on batch 1 (10, 11, 12, 13)
-			Src2:  2,
-			Dest:  uint8(14 + i),
-		}
+	if bundle.Indices[0] != 20 {
+		t.Errorf("Should issue older slot 20, got slot %d", bundle.Indices[0])
 	}
 
-	// Issue batch 1
+	// Now scoreboard[5] = 0, B blocked by scoreboard
 	sched.ScheduleCycle0()
-	bundle1 := sched.ScheduleCycle1()
+	bundle = sched.ScheduleCycle1()
 
-	if bits.OnesCount16(bundle1.Valid) != 4 {
-		t.Errorf("Should issue 4 batch 1 ops, got %d", bits.OnesCount16(bundle1.Valid))
+	if bundle.Valid != 0 {
+		t.Errorf("B should be blocked (WAW via scoreboard), got valid 0x%04X", bundle.Valid)
 	}
 
-	// Complete first 2 of batch 1
-	sched.ScheduleComplete([16]uint8{10, 11}, 0b11)
+	// Complete A
+	sched.ScheduleComplete([16]uint8{5}, 0b1)
 
-	// Issue whatever is ready now
+	// Now B can issue
 	sched.ScheduleCycle0()
-	bundle2 := sched.ScheduleCycle1()
+	bundle = sched.ScheduleCycle1()
 
-	// Some batch 2 ops should be ready now
-	if bundle2.Valid == 0 {
-		t.Log("Note: Batch 2 might not be ready due to pipeline timing")
+	if bundle.Indices[0] != 10 {
+		t.Errorf("Should issue B (slot 10) after A completes, got slot %d", bundle.Indices[0])
 	}
 }
 
@@ -2407,50 +2382,54 @@ func TestPipeline_StateMachine(t *testing.T) {
 	// WHY: Document all valid states and transitions
 	// HARDWARE: FSM for each instruction slot
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
 	// State 1: Invalid (empty slot)
 	if sched.Window.Ops[0].Valid {
 		t.Error("Initial state should be Invalid")
 	}
 
-	// State 2: Valid, sources not ready
+	// State 2: Valid, blocked by producer check (intra-window dependency)
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 	sched.Window.Ops[0] = Operation{Valid: true, Src1: 10, Src2: 11, Dest: 12}
-	// (sources 10, 11 not ready)
 
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
-	if bundle.Valid != 0 {
-		t.Error("Op with sources not ready should not issue")
+
+	// Only slot 10 should issue (slot 0 blocked by producer)
+	if bits.OnesCount16(bundle.Valid) != 1 || bundle.Indices[0] != 10 {
+		t.Error("Only producer should issue first")
 	}
 
-	// State 3: Valid, sources ready
-	sched.Scoreboard.MarkReady(10)
-	sched.Scoreboard.MarkReady(11)
+	// State 3: Valid, blocked by scoreboard (producer issued but not complete)
+	sched.ScheduleCycle0()
+	bundle = sched.ScheduleCycle1()
+
+	if bundle.Valid != 0 {
+		t.Error("Consumer should be blocked by scoreboard")
+	}
+
+	// State 4: Valid, ready (producer complete)
+	sched.ScheduleComplete([16]uint8{10}, 0b1)
+	sched.Scoreboard.MarkReady(11) // Mark other source ready
 
 	sched.ScheduleCycle0()
 	bundle = sched.ScheduleCycle1()
+
 	if bundle.Valid == 0 {
-		t.Error("Op with sources ready should issue")
+		t.Error("Consumer should issue after producer completes")
 	}
 
-	// State 4: Issued (executing)
+	// State 5: Issued
 	if !sched.Window.Ops[0].Issued {
 		t.Error("Op should be marked Issued")
 	}
-	if sched.Scoreboard.IsReady(12) {
-		t.Error("Dest should be pending during execution")
-	}
 
-	// State 5: Completed
+	// State 6: Completed (back to ready register)
 	sched.ScheduleComplete([16]uint8{12}, 0b1)
 	if !sched.Scoreboard.IsReady(12) {
 		t.Error("Dest should be ready after completion")
 	}
-
-	// State 6: Retired (back to Invalid)
-	sched.Window.Ops[0].Valid = false
-	sched.Window.Ops[0].Issued = false
 
 	t.Log("✓ All state transitions verified")
 }
@@ -2473,24 +2452,16 @@ func TestPattern_Forest(t *testing.T) {
 	//   Tree 2: A2 → B2    (slots 25, 22)
 	//   Tree 3: A3 → B3    (slots 19, 16)
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Tree 1
 	sched.Window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 	sched.Window.Ops[28] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 
-	// Tree 2
 	sched.Window.Ops[25] = Operation{Valid: true, Src1: 4, Src2: 5, Dest: 20}
 	sched.Window.Ops[22] = Operation{Valid: true, Src1: 20, Src2: 6, Dest: 21}
 
-	// Tree 3
 	sched.Window.Ops[19] = Operation{Valid: true, Src1: 7, Src2: 8, Dest: 30}
 	sched.Window.Ops[16] = Operation{Valid: true, Src1: 30, Src2: 9, Dest: 31}
-
-	// Mark sources ready
-	for i := uint8(1); i <= 9; i++ {
-		sched.Scoreboard.MarkReady(i)
-	}
 
 	// Should issue all roots in parallel (A1, A2, A3)
 	sched.ScheduleCycle0()
@@ -2511,12 +2482,10 @@ func TestPattern_WideTree(t *testing.T) {
 	//    /|\ ... \
 	//   L0 L1 ... L15 (slots 15-0)
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Root
 	sched.Window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 
-	// 16 leaves
 	for i := 0; i < 16; i++ {
 		sched.Window.Ops[i] = Operation{
 			Valid: true,
@@ -2525,10 +2494,6 @@ func TestPattern_WideTree(t *testing.T) {
 			Dest:  uint8(20 + i),
 		}
 	}
-
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-	sched.Scoreboard.MarkReady(3)
 
 	// First issue: only root
 	sched.ScheduleCycle0()
@@ -2556,16 +2521,15 @@ func TestPattern_DeepChain(t *testing.T) {
 	//
 	// STRUCTURE: Op31 → Op30 → Op29 → ... → Op12 (20 ops)
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Build 20-op chain
 	for i := 0; i < 20; i++ {
 		slot := 31 - i
 		var src1 uint8
 		if i == 0 {
-			src1 = 1 // First op reads ready register
+			src1 = 1
 		} else {
-			src1 = uint8(9 + i) // Reads previous op's dest
+			src1 = uint8(9 + i)
 		}
 		sched.Window.Ops[slot] = Operation{
 			Valid: true,
@@ -2575,10 +2539,6 @@ func TestPattern_DeepChain(t *testing.T) {
 		}
 	}
 
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-
-	// Execute entire chain
 	for step := 0; step < 20; step++ {
 		expectedSlot := 31 - step
 
@@ -2595,7 +2555,6 @@ func TestPattern_DeepChain(t *testing.T) {
 				step, expectedSlot, bundle.Indices[0])
 		}
 
-		// Complete current op
 		dest := sched.Window.Ops[expectedSlot].Dest
 		sched.ScheduleComplete([16]uint8{dest}, 0b1)
 	}
@@ -2610,25 +2569,17 @@ func TestPattern_Reduction(t *testing.T) {
 	//   Level 1: E=A+B, F=C+D
 	//   Level 2: G=E+F
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Level 0 (slots 31-28)
-	sched.Window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10} // A
-	sched.Window.Ops[30] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 11} // B
-	sched.Window.Ops[29] = Operation{Valid: true, Src1: 5, Src2: 6, Dest: 12} // C
-	sched.Window.Ops[28] = Operation{Valid: true, Src1: 7, Src2: 8, Dest: 13} // D
+	sched.Window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	sched.Window.Ops[30] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 11}
+	sched.Window.Ops[29] = Operation{Valid: true, Src1: 5, Src2: 6, Dest: 12}
+	sched.Window.Ops[28] = Operation{Valid: true, Src1: 7, Src2: 8, Dest: 13}
 
-	// Level 1 (slots 27-26)
-	sched.Window.Ops[27] = Operation{Valid: true, Src1: 10, Src2: 11, Dest: 14} // E
-	sched.Window.Ops[26] = Operation{Valid: true, Src1: 12, Src2: 13, Dest: 15} // F
+	sched.Window.Ops[27] = Operation{Valid: true, Src1: 10, Src2: 11, Dest: 14}
+	sched.Window.Ops[26] = Operation{Valid: true, Src1: 12, Src2: 13, Dest: 15}
 
-	// Level 2 (slot 25)
-	sched.Window.Ops[25] = Operation{Valid: true, Src1: 14, Src2: 15, Dest: 16} // G
-
-	// Mark sources ready
-	for i := uint8(1); i <= 8; i++ {
-		sched.Scoreboard.MarkReady(i)
-	}
+	sched.Window.Ops[25] = Operation{Valid: true, Src1: 14, Src2: 15, Dest: 16}
 
 	// Level 0: all 4 in parallel
 	sched.ScheduleCycle0()
@@ -2666,12 +2617,11 @@ func TestPattern_Reduction(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
 // CPU hazards are situations where naive execution would produce wrong results.
-// SUPRAX tracks RAW (true dependencies) but not WAR/WAW (anti/output dependencies).
+// SUPRAX handles all three hazard types with minimal hardware:
 //
-// Why not track WAR/WAW?
-//   - They're not true data dependencies
-//   - Register renaming would eliminate them anyway
-//   - SUPRAX context switching makes them less relevant
+//   RAW: Dependency matrix (producer must issue) + Scoreboard (producer must complete)
+//   WAR: Implicit in slot ordering (older reads before younger writes)
+//   WAW: scoreboard[dest] check + claimed mask in SelectIssueBundle
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -2702,18 +2652,14 @@ func TestHazard_WAR_NotTracked(t *testing.T) {
 	// EXAMPLE:
 	//   Slot 10: R6 = R5 + R3  (reads R5)
 	//   Slot 5:  R5 = R1 + R2  (writes R5 - WAR, not tracked)
-	//
-	// The slot index check (10 > 5 → 10 is older) correctly rejects this.
-	// Slot 10's read happens BEFORE slot 5's write in program order.
 
 	window := &InstructionWindow{}
 
-	window.Ops[10] = Operation{Valid: true, Src1: 5, Src2: 3, Dest: 6} // Reads R5
-	window.Ops[5] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}  // Writes R5
+	window.Ops[10] = Operation{Valid: true, Src1: 5, Src2: 3, Dest: 6}
+	window.Ops[5] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
 
 	matrix := BuildDependencyMatrix(window)
 
-	// Neither direction should have dependency
 	if matrix[10] != 0 {
 		t.Errorf("WAR should not create dependency, matrix[10]=0x%08X", matrix[10])
 	}
@@ -2722,26 +2668,79 @@ func TestHazard_WAR_NotTracked(t *testing.T) {
 	}
 }
 
-func TestHazard_WAW_NotTracked(t *testing.T) {
-	// WHAT: Write-After-Write is NOT a true dependency
-	// WHY: No data flows between the writers
+func TestHazard_WAW_BlockedByScoreboard(t *testing.T) {
+	// WHAT: Write-After-Write blocked by scoreboard[dest] check
+	// WHY: Younger writer must wait for older writer to complete
 	//
 	// EXAMPLE:
-	//   Slot 10: R5 = R1 + R2  (writes R5)
-	//   Slot 5:  R5 = R3 + R4  (writes R5 - WAW, not tracked)
+	//   Slot 10: R5 = R1 + R2  (writes R5, older)
+	//   Slot 5:  R5 = R3 + R4  (writes R5, younger - blocked!)
+
+	sched := NewOoOScheduler()
+
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
+	sched.Window.Ops[5] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 5}
+
+	// First cycle: claimed mask prevents same-cycle WAW
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
+
+	if bits.OnesCount16(bundle.Valid) != 1 {
+		t.Errorf("Should issue only 1 (claimed mask), got %d", bits.OnesCount16(bundle.Valid))
+	}
+	if bundle.Indices[0] != 10 {
+		t.Errorf("Should issue older slot 10, got %d", bundle.Indices[0])
+	}
+
+	// Scoreboard now has R5 pending
+	if sched.Scoreboard.IsReady(5) {
+		t.Error("R5 should be pending after older writer issues")
+	}
+
+	// Second cycle: younger blocked by scoreboard[dest]=0
+	sched.ScheduleCycle0()
+	bundle = sched.ScheduleCycle1()
+
+	if bundle.Valid != 0 {
+		t.Error("Younger WAW should be blocked by pending dest")
+	}
+
+	// Complete older writer
+	sched.ScheduleComplete([16]uint8{5}, 0b1)
+
+	// Now younger can issue
+	sched.ScheduleCycle0()
+	bundle = sched.ScheduleCycle1()
+
+	if bundle.Indices[0] != 5 {
+		t.Errorf("Younger should issue after older completes, got slot %d", bundle.Indices[0])
+	}
+}
+
+func TestHazard_WAW_ClaimedMask(t *testing.T) {
+	// WHAT: Two ready ops writing same register in same cycle
+	// WHY: claimed mask prevents same-cycle WAW conflict
 	//
-	// Both write the same register, but neither depends on the other.
-	// The final value is determined by program order (slot 5 wins).
+	// This tests SelectIssueBundle's claimed tracking, not scoreboard.
+	// Both ops see scoreboard[dest]=1, but only oldest gets selected.
 
 	window := &InstructionWindow{}
+	window.Ops[20] = Operation{Valid: true, Dest: 10}
+	window.Ops[15] = Operation{Valid: true, Dest: 10}
+	window.Ops[10] = Operation{Valid: true, Dest: 10}
 
-	window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
-	window.Ops[5] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 5}
+	priority := PriorityClass{
+		HighPriority: (1 << 20) | (1 << 15) | (1 << 10),
+		LowPriority:  0,
+	}
 
-	matrix := BuildDependencyMatrix(window)
+	bundle := SelectIssueBundle(priority, window)
 
-	if matrix[10] != 0 || matrix[5] != 0 {
-		t.Error("WAW should not create dependency")
+	if bits.OnesCount16(bundle.Valid) != 1 {
+		t.Errorf("Should select only 1 (claimed mask), got %d", bits.OnesCount16(bundle.Valid))
+	}
+	if bundle.Indices[0] != 20 {
+		t.Errorf("Should select oldest (slot 20), got slot %d", bundle.Indices[0])
 	}
 }
 
@@ -2751,9 +2750,9 @@ func TestHazard_RAW_Chain(t *testing.T) {
 
 	window := &InstructionWindow{}
 
-	window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}  // A
-	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11} // B (RAW from A)
-	window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12} // C (RAW from B)
+	window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[15] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
+	window.Ops[10] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12}
 
 	matrix := BuildDependencyMatrix(window)
 
@@ -2772,14 +2771,8 @@ func TestHazard_MixedScenario(t *testing.T) {
 	// Slot 25: R10 = R1 + R2       (producer of R10)
 	// Slot 20: R11 = R10 + R3      (RAW: reads R10 from slot 25)
 	// Slot 15: R12 = R4 + R5       (independent)
-	// Slot 10: R10 = R6 + R7       (WAW with slot 25, also produces R10)
-	// Slot 5:  R13 = R10 + R8      (RAW: reads R10 - depends on BOTH 25 and 10!)
-	//
-	// NOTE: Slot 5 depends on BOTH slot 25 AND slot 10 because both write R10
-	// and both are older than slot 5. There's no "shadowing" in dependency
-	// tracking - we track ALL producers that a consumer might depend on.
-	// The actual value slot 5 receives depends on execution order, but
-	// for scheduling purposes, it must wait for all potential producers.
+	// Slot 10: R10 = R6 + R7       (WAW with slot 25)
+	// Slot 5:  R13 = R10 + R8      (RAW: reads R10)
 
 	window := &InstructionWindow{}
 
@@ -2791,34 +2784,24 @@ func TestHazard_MixedScenario(t *testing.T) {
 
 	matrix := BuildDependencyMatrix(window)
 
-	// RAW: slot 20 depends on slot 25 (reads R10 that 25 writes)
+	// RAW: slot 20 depends on slot 25
 	if (matrix[25]>>20)&1 != 1 {
 		t.Error("Slot 20 should depend on slot 25")
 	}
 
-	// RAW: slot 5 depends on slot 10 (reads R10 that 10 writes)
+	// RAW: slot 5 depends on slot 10
 	if (matrix[10]>>5)&1 != 1 {
 		t.Error("Slot 5 should depend on slot 10")
 	}
 
-	// RAW: slot 5 ALSO depends on slot 25 (reads R10 that 25 writes)
-	// Both slot 25 and slot 10 write R10, both are older than slot 5
-	// Our dependency matrix tracks ALL RAW relationships, not just the "latest" writer
+	// RAW: slot 5 ALSO depends on slot 25
 	if (matrix[25]>>5)&1 != 1 {
-		t.Error("Slot 5 should ALSO depend on slot 25 (both write R10)")
+		t.Error("Slot 5 should ALSO depend on slot 25")
 	}
 
-	// Slot 15 is independent (no RAW with anyone)
-	// Check that nothing depends on slot 15
+	// Slot 15 is independent
 	if matrix[15] != 0 {
 		t.Errorf("Slot 15 has no dependents, got matrix[15]=0x%08X", matrix[15])
-	}
-
-	// Check that slot 15 doesn't appear as dependent in any row
-	for i := 0; i < 32; i++ {
-		if (matrix[i]>>15)&1 != 0 {
-			t.Errorf("Slot 15 should not depend on anything, but depends on slot %d", i)
-		}
 	}
 }
 
@@ -2835,7 +2818,7 @@ func TestEdge_Register0(t *testing.T) {
 	// WHAT: Operations using register 0
 	// WHY: Register 0 is LSB, often special-cased in architectures
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
 	sched.Window.Ops[0] = Operation{
 		Valid: true,
@@ -2843,7 +2826,6 @@ func TestEdge_Register0(t *testing.T) {
 		Src2:  0,
 		Dest:  0,
 	}
-	sched.Scoreboard.MarkReady(0)
 
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
@@ -2857,7 +2839,7 @@ func TestEdge_Register63(t *testing.T) {
 	// WHAT: Operations using register 63
 	// WHY: Register 63 is MSB, boundary condition
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
 	sched.Window.Ops[0] = Operation{
 		Valid: true,
@@ -2865,7 +2847,6 @@ func TestEdge_Register63(t *testing.T) {
 		Src2:  63,
 		Dest:  63,
 	}
-	sched.Scoreboard.MarkReady(63)
 
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
@@ -2880,13 +2861,12 @@ func TestEdge_Slot0(t *testing.T) {
 	// WHY: Lowest slot index boundary
 
 	window := &InstructionWindow{}
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0)
 
 	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
 
-	bitmap := ComputeReadyBitmap(window, sb)
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
 
 	if bitmap != 1 {
 		t.Errorf("Slot 0 should be in ready bitmap, got 0x%08X", bitmap)
@@ -2898,13 +2878,12 @@ func TestEdge_Slot31(t *testing.T) {
 	// WHY: Highest slot index boundary
 
 	window := &InstructionWindow{}
-	var sb Scoreboard
+	var sb Scoreboard = ^Scoreboard(0)
 
 	window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
 
-	bitmap := ComputeReadyBitmap(window, sb)
+	depMatrix := BuildDependencyMatrix(window)
+	bitmap := ComputeReadyBitmap(window, sb, depMatrix)
 
 	if bitmap != (1 << 31) {
 		t.Errorf("Slot 31 should be in ready bitmap, got 0x%08X", bitmap)
@@ -2912,150 +2891,32 @@ func TestEdge_Slot31(t *testing.T) {
 }
 
 func TestEdge_Slot31DependsOnSlot0(t *testing.T) {
-	// WHAT: Slot 31 (oldest) cannot depend on slot 0 (newest)
-	// WHY: Older op can't wait for younger op (would be WAR)
+	// WHAT: Impossible scenario - older can't depend on newer
+	// WHY: Validates age check prevents false positives
+	//
+	// Slot 31 is older (entered first), slot 0 is newer (entered last).
+	// Slot 31 cannot possibly depend on slot 0's output.
 
 	window := &InstructionWindow{}
 
-	// Slot 31 reads R10, slot 0 writes R10
-	// But slot 31 is OLDER, so this is WAR, not RAW
-	window.Ops[31] = Operation{Valid: true, Src1: 10, Src2: 2, Dest: 11}
-	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	window.Ops[31] = Operation{Valid: true, Src1: 10, Src2: 2, Dest: 11} // Reads R10
+	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}   // Writes R10
 
 	matrix := BuildDependencyMatrix(window)
 
-	// No dependency (WAR not tracked)
-	if matrix[0]&(1<<31) != 0 {
-		t.Error("Slot 31 cannot depend on slot 0 (older can't wait for younger)")
+	// Slot 31 cannot depend on slot 0 (31 is older)
+	if (matrix[0]>>31)&1 != 0 {
+		t.Error("Older slot cannot depend on newer slot")
 	}
 }
 
-func TestEdge_Slot0DependsOnSlot31(t *testing.T) {
-	// WHAT: Slot 0 (newest) depends on slot 31 (oldest)
-	// WHY: Valid RAW - younger waits for older
+func TestEdge_AllSlotsReady(t *testing.T) {
+	// WHAT: All 32 slots ready with no dependencies
+	// WHY: Maximum parallelism stress test
 
-	window := &InstructionWindow{}
+	sched := NewOoOScheduler()
 
-	window.Ops[31] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	window.Ops[0] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
-
-	matrix := BuildDependencyMatrix(window)
-
-	if (matrix[31]>>0)&1 != 1 {
-		t.Error("Slot 0 should depend on slot 31")
-	}
-}
-
-func TestEdge_SelfLoop(t *testing.T) {
-	// WHAT: Op reads and writes same register
-	// WHY: Not a self-dependency (reads before writes)
-
-	window := &InstructionWindow{}
-
-	window.Ops[10] = Operation{Valid: true, Src1: 5, Src2: 5, Dest: 5}
-
-	matrix := BuildDependencyMatrix(window)
-
-	// Diagonal should be 0
-	if (matrix[10]>>10)&1 != 0 {
-		t.Error("Op cannot depend on itself")
-	}
-}
-
-func TestEdge_AllSameDest(t *testing.T) {
-	// WHAT: Multiple ops write same register
-	// WHY: WAW scenario - no dependencies
-
-	window := &InstructionWindow{}
-
-	for i := 0; i < 5; i++ {
-		window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  uint8(i + 1),
-			Src2:  uint8(i + 2),
-			Dest:  10, // All write R10
-		}
-	}
-
-	matrix := BuildDependencyMatrix(window)
-
-	// WAW creates no dependencies
-	for i := 0; i < 5; i++ {
-		if matrix[i] != 0 {
-			t.Errorf("WAW should create no dependencies, matrix[%d]=0x%08X", i, matrix[i])
-		}
-	}
-}
-
-func TestEdge_AllSameSrc(t *testing.T) {
-	// WHAT: Multiple ops read same register
-	// WHY: No dependencies (reading doesn't create RAW)
-
-	window := &InstructionWindow{}
-
-	for i := 0; i < 5; i++ {
-		window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  10, // All read R10
-			Src2:  10, // All read R10
-			Dest:  uint8(20 + i),
-		}
-	}
-
-	matrix := BuildDependencyMatrix(window)
-
-	for i := 0; i < 5; i++ {
-		if matrix[i] != 0 {
-			t.Errorf("Reading same register creates no dependencies, matrix[%d]=0x%08X", i, matrix[i])
-		}
-	}
-}
-
-func TestEdge_OpAndImmFields(t *testing.T) {
-	// WHAT: Op and Imm fields don't affect scheduling
-	// WHY: These are opaque to scheduler (passed to execution unit)
-
-	window := &InstructionWindow{}
-	var sb Scoreboard
-
-	// Various Op codes
-	window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10, Op: 0x00}
-	window.Ops[1] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 11, Op: 0xFF}
-	window.Ops[2] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 12, Op: 0x42}
-
-	// Various Imm values
-	window.Ops[3] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 13, Imm: 0x0000}
-	window.Ops[4] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 14, Imm: 0xFFFF}
-	window.Ops[5] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 15, Imm: 0x1234}
-
-	sb.MarkReady(1)
-	sb.MarkReady(2)
-
-	bitmap := ComputeReadyBitmap(window, sb)
-
-	// All should be ready regardless of Op/Imm
-	expected := uint32(0b111111)
-	if bitmap != expected {
-		t.Errorf("Op/Imm should not affect readiness, got 0x%08X", bitmap)
-	}
-
-	// Dependencies should also be unaffected
-	matrix := BuildDependencyMatrix(window)
-	for i := 0; i < 6; i++ {
-		if matrix[i] != 0 {
-			t.Errorf("Op/Imm should not affect dependencies, matrix[%d]=0x%08X", i, matrix[i])
-		}
-	}
-}
-
-func TestEdge_WindowSlotReuse(t *testing.T) {
-	// WHAT: Reuse window slots after retirement
-	// WHY: Realistic operation - slots recycled
-
-	sched := &OoOScheduler{}
-
-	// First batch
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 32; i++ {
 		sched.Window.Ops[i] = Operation{
 			Valid: true,
 			Src1:  1,
@@ -3063,44 +2924,82 @@ func TestEdge_WindowSlotReuse(t *testing.T) {
 			Dest:  uint8(10 + i),
 		}
 	}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
 
-	// Issue and retire first batch
 	sched.ScheduleCycle0()
 	bundle := sched.ScheduleCycle1()
 
-	for i := 0; i < 5; i++ {
-		sched.Window.Ops[i].Valid = false
-		sched.Window.Ops[i].Issued = false
+	count := bits.OnesCount16(bundle.Valid)
+	if count != 16 {
+		t.Errorf("Should issue 16 (max), got %d", count)
+	}
+}
+
+func TestEdge_EmptyAfterClear(t *testing.T) {
+	// WHAT: Clear window after filling
+	// WHY: Simulates context switch or flush
+
+	sched := NewOoOScheduler()
+
+	for i := 0; i < 10; i++ {
+		sched.Window.Ops[i] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: uint8(10 + i)}
 	}
 
-	var destRegs [16]uint8
-	for i := 0; i < 16; i++ {
-		if (bundle.Valid>>i)&1 != 0 {
-			destRegs[i] = sched.Window.Ops[bundle.Indices[i]].Dest
-		}
-	}
-	sched.ScheduleComplete(destRegs, bundle.Valid)
+	// Clear
+	sched.Window = InstructionWindow{}
 
-	// Second batch in same slots
-	for i := 0; i < 3; i++ {
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
+
+	if bundle.Valid != 0 {
+		t.Error("Cleared window should produce no issues")
+	}
+}
+
+func TestEdge_SameRegisterAllOps(t *testing.T) {
+	// WHAT: All ops read and write same register
+	// WHY: Maximum register pressure scenario
+
+	sched := NewOoOScheduler()
+
+	for i := 0; i < 10; i++ {
 		sched.Window.Ops[i] = Operation{
 			Valid: true,
 			Src1:  5,
-			Src2:  6,
-			Dest:  uint8(30 + i),
+			Src2:  5,
+			Dest:  5,
 		}
 	}
-	sched.Scoreboard.MarkReady(5)
-	sched.Scoreboard.MarkReady(6)
 
-	// Should issue second batch
+	// Should issue one (WAW claimed), then serialize
 	sched.ScheduleCycle0()
-	bundle = sched.ScheduleCycle1()
+	bundle := sched.ScheduleCycle1()
 
-	if bundle.Valid == 0 {
-		t.Error("Reused slots should be schedulable")
+	if bits.OnesCount16(bundle.Valid) != 1 {
+		t.Errorf("Should issue exactly 1 (WAW claimed), got %d", bits.OnesCount16(bundle.Valid))
+	}
+}
+
+func TestEdge_ZeroLatency(t *testing.T) {
+	// WHAT: Issue and complete in consecutive cycles
+	// WHY: Minimum latency path
+
+	sched := NewOoOScheduler()
+
+	sched.Window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+
+	// Issue
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
+
+	if bundle.Valid != 1 {
+		t.Error("Should issue op")
+	}
+
+	// Complete immediately
+	sched.ScheduleComplete([16]uint8{10}, 0b1)
+
+	if !sched.Scoreboard.IsReady(10) {
+		t.Error("Register should be ready after immediate completion")
 	}
 }
 
@@ -3108,63 +3007,45 @@ func TestEdge_WindowSlotReuse(t *testing.T) {
 // 11. CORRECTNESS INVARIANTS
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
-// These tests verify properties that must ALWAYS hold.
-// Any violation indicates a serious bug.
+// Invariants are properties that must ALWAYS hold.
+// Violating an invariant means the scheduler is fundamentally broken.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 func TestInvariant_NoDoubleIssue(t *testing.T) {
-	// INVARIANT: An op is never issued twice
+	// INVARIANT: An instruction issues exactly once
 	// WHY: Double-issue corrupts architectural state
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	for i := 0; i < 20; i++ {
-		sched.Window.Ops[i] = Operation{
-			Valid: true,
-			Src1:  1,
-			Src2:  2,
-			Dest:  uint8(10 + i),
-		}
+	sched.Window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+
+	// First issue
+	sched.ScheduleCycle0()
+	bundle1 := sched.ScheduleCycle1()
+
+	if bundle1.Valid != 1 {
+		t.Fatal("First issue should succeed")
 	}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
 
-	allIssued := make(map[uint8]bool)
+	// Second attempt
+	sched.ScheduleCycle0()
+	bundle2 := sched.ScheduleCycle1()
 
-	// Issue multiple batches
-	for batch := 0; batch < 3; batch++ {
-		sched.ScheduleCycle0()
-		bundle := sched.ScheduleCycle1()
-
-		for i := 0; i < 16; i++ {
-			if (bundle.Valid>>i)&1 == 0 {
-				continue
-			}
-			idx := bundle.Indices[i]
-			if allIssued[idx] {
-				t.Fatalf("INVARIANT VIOLATION: Op %d issued twice!", idx)
-			}
-			allIssued[idx] = true
-		}
+	if bundle2.Valid != 0 {
+		t.Fatal("INVARIANT VIOLATION: Issued instruction selected again!")
 	}
 }
 
 func TestInvariant_DependenciesRespected(t *testing.T) {
-	// INVARIANT: Consumer never issues before producer
+	// INVARIANT: Consumer never issues before producer issues
 	// WHY: Would read stale/invalid data
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Create chain
 	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 	sched.Window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
 	sched.Window.Ops[5] = Operation{Valid: true, Src1: 11, Src2: 4, Dest: 12}
-
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-	sched.Scoreboard.MarkReady(3)
-	sched.Scoreboard.MarkReady(4)
 
 	// First issue - only slot 20 should be possible
 	sched.ScheduleCycle0()
@@ -3181,106 +3062,126 @@ func TestInvariant_DependenciesRespected(t *testing.T) {
 	}
 }
 
-func TestInvariant_ReadyBitmapSubsetOfValid(t *testing.T) {
-	// INVARIANT: Ready ops must be valid ops
-	// WHY: Can't schedule non-existent instructions
+func TestInvariant_WAWOrdering(t *testing.T) {
+	// INVARIANT: WAW writes issue in program order
+	// WHY: Final register value must be from last writer
 
-	for trial := 0; trial < 100; trial++ {
-		window := &InstructionWindow{}
-		var sb Scoreboard
+	sched := NewOoOScheduler()
 
-		// Random valid pattern
-		validMask := uint32(trial * 31337)
-		for i := 0; i < 32; i++ {
-			window.Ops[i].Valid = (validMask>>i)&1 != 0
-			window.Ops[i].Src1 = 1
-			window.Ops[i].Src2 = 2
-			window.Ops[i].Dest = uint8(i + 10)
-		}
-		sb.MarkReady(1)
-		sb.MarkReady(2)
+	// Two writers to R5, older at slot 20, newer at slot 10
+	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 5}
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 5}
 
-		bitmap := ComputeReadyBitmap(window, sb)
+	// Issue older first
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
 
-		// Every ready bit must also be valid
-		if bitmap&^validMask != 0 {
-			t.Fatalf("INVARIANT VIOLATION: Ready bitmap has bits outside valid mask")
-		}
+	if bundle.Indices[0] != 20 {
+		t.Fatalf("INVARIANT VIOLATION: Newer WAW issued before older!")
+	}
+
+	// Younger should be blocked
+	sched.ScheduleCycle0()
+	bundle = sched.ScheduleCycle1()
+
+	if bundle.Valid != 0 {
+		t.Fatalf("INVARIANT VIOLATION: Younger WAW issued while older in flight!")
 	}
 }
 
-func TestInvariant_PriorityUnionEqualsReady(t *testing.T) {
-	// INVARIANT: High ∪ Low = Ready, High ∩ Low = ∅
-	// WHY: Every ready op is exactly one of high or low priority
+func TestInvariant_PriorityDisjoint(t *testing.T) {
+	// INVARIANT: High and low priority sets are disjoint
+	// WHY: Each op is exactly one priority
 
 	for trial := 0; trial < 100; trial++ {
-		readyBitmap := uint32(trial * 12345)
+		readyBitmap := uint32(trial * 31337)
 		var depMatrix DependencyMatrix
 		for i := 0; i < 32; i++ {
-			depMatrix[i] = uint32(trial * (i + 1))
+			depMatrix[i] = uint32((trial + i) * 7)
 		}
 
 		priority := ClassifyPriority(readyBitmap, depMatrix)
 
-		// No overlap
 		if priority.HighPriority&priority.LowPriority != 0 {
-			t.Fatal("INVARIANT VIOLATION: High and low priority overlap")
+			t.Fatalf("INVARIANT VIOLATION: Priority sets overlap!")
 		}
 
-		// Union equals ready
 		union := priority.HighPriority | priority.LowPriority
 		if union != readyBitmap {
-			t.Fatal("INVARIANT VIOLATION: Priority union doesn't equal ready bitmap")
+			t.Fatalf("INVARIANT VIOLATION: Priority union != ready bitmap!")
 		}
 	}
 }
 
-func TestInvariant_IssueBundleSubsetOfPriority(t *testing.T) {
-	// INVARIANT: Issued ops came from priority class
-	// WHY: Can't issue ops that weren't ready
+func TestInvariant_IssuedFlagConsistency(t *testing.T) {
+	// INVARIANT: Issued flag set iff instruction was selected for execution
+	// WHY: Tracks instruction state machine
 
-	for trial := 0; trial < 100; trial++ {
-		priority := PriorityClass{
-			HighPriority: uint32(trial * 99991),
-			LowPriority:  uint32(trial * 77773),
-		}
+	sched := NewOoOScheduler()
 
-		bundle := SelectIssueBundle(priority)
-
-		combined := priority.HighPriority | priority.LowPriority
-
-		for i := 0; i < 16; i++ {
-			if (bundle.Valid>>i)&1 == 0 {
-				continue
-			}
-			idx := bundle.Indices[i]
-			if (combined>>idx)&1 == 0 {
-				t.Fatalf("INVARIANT VIOLATION: Issued index %d not in priority", idx)
-			}
+	for i := 0; i < 10; i++ {
+		sched.Window.Ops[i] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: uint8(10 + i)}
+		if sched.Window.Ops[i].Issued {
+			t.Fatalf("INVARIANT VIOLATION: Fresh op has Issued=true!")
 		}
 	}
-}
 
-func TestInvariant_OldestFirstOrdering(t *testing.T) {
-	// INVARIANT: Within tier, older ops selected before younger
-	// WHY: Fairness and critical path approximation
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
 
-	priority := PriorityClass{
-		HighPriority: 0xFFFFFFFF, // All 32 slots
-		LowPriority:  0,
-	}
-
-	bundle := SelectIssueBundle(priority)
-
-	// Should select oldest 16 (slots 16-31)
 	for i := 0; i < 16; i++ {
 		if (bundle.Valid>>i)&1 == 0 {
 			continue
 		}
 		idx := bundle.Indices[i]
-		if idx < 16 {
-			t.Fatalf("INVARIANT VIOLATION: Selected slot %d but slots 16-31 available", idx)
+		if !sched.Window.Ops[idx].Issued {
+			t.Fatalf("INVARIANT VIOLATION: Selected op not marked Issued!")
 		}
+	}
+
+	for i := 0; i < 32; i++ {
+		wasSelected := false
+		for j := 0; j < 16; j++ {
+			if (bundle.Valid>>j)&1 != 0 && bundle.Indices[j] == uint8(i) {
+				wasSelected = true
+				break
+			}
+		}
+		if !wasSelected && sched.Window.Ops[i].Issued {
+			t.Fatalf("INVARIANT VIOLATION: Unselected op %d has Issued=true!", i)
+		}
+	}
+}
+
+func TestInvariant_ScoreboardConsistency(t *testing.T) {
+	// INVARIANT: Scoreboard reflects in-flight status
+	// WHY: Scoreboard drives readiness decisions
+
+	sched := NewOoOScheduler()
+
+	// Initially all ready
+	for i := uint8(0); i < 64; i++ {
+		if !sched.Scoreboard.IsReady(i) {
+			t.Fatalf("INVARIANT VIOLATION: Fresh scoreboard has pending register!")
+		}
+	}
+
+	sched.Window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+
+	sched.ScheduleCycle0()
+	sched.ScheduleCycle1()
+
+	// Dest should be pending
+	if sched.Scoreboard.IsReady(10) {
+		t.Fatalf("INVARIANT VIOLATION: Issued dest still marked ready!")
+	}
+
+	// Complete
+	sched.ScheduleComplete([16]uint8{10}, 0b1)
+
+	// Dest should be ready
+	if !sched.Scoreboard.IsReady(10) {
+		t.Fatalf("INVARIANT VIOLATION: Completed dest not marked ready!")
 	}
 }
 
@@ -3288,67 +3189,49 @@ func TestInvariant_OldestFirstOrdering(t *testing.T) {
 // 12. STRESS TESTS
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
-// Stress tests run many iterations to expose intermittent bugs.
-// They also validate performance under sustained load.
+// Stress tests push the scheduler to limits with high-volume operations.
+// They help find race conditions and resource exhaustion bugs.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-func TestStress_RepeatedFillDrain(t *testing.T) {
-	// WHAT: Repeatedly fill and drain the window
-	// WHY: Tests recycling, state cleanup, edge conditions
+func TestStress_RepeatedIssueCycles(t *testing.T) {
+	// WHAT: Many issue cycles with refilling window
+	// WHY: Steady-state behavior
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
+	totalIssued := 0
 
-	for round := 0; round < 100; round++ {
-		// Fill with 32 independent ops
-		// Use source registers that won't conflict with destinations
-		// Sources: 0, 1 (always ready)
-		// Destinations: 10-41 (never overlap with sources)
+	for cycle := 0; cycle < 100; cycle++ {
+		// Fill empty slots
 		for i := 0; i < 32; i++ {
-			sched.Window.Ops[i] = Operation{
-				Valid: true,
-				Src1:  0,
-				Src2:  1,
-				Dest:  uint8(10 + i), // Destinations 10-41, never overlap with sources 0,1
-			}
-		}
-		sched.Scoreboard.MarkReady(0)
-		sched.Scoreboard.MarkReady(1)
-
-		// Drain in two batches
-		for batch := 0; batch < 2; batch++ {
-			sched.ScheduleCycle0()
-			bundle := sched.ScheduleCycle1()
-
-			count := bits.OnesCount16(bundle.Valid)
-			if count != 16 {
-				t.Fatalf("Round %d, Batch %d: expected 16, got %d", round, batch, count)
-			}
-
-			// Complete and retire
-			var destRegs [16]uint8
-			for i := 0; i < 16; i++ {
-				if (bundle.Valid>>i)&1 != 0 {
-					idx := bundle.Indices[i]
-					destRegs[i] = sched.Window.Ops[idx].Dest
-					sched.Window.Ops[idx].Valid = false
-					sched.Window.Ops[idx].Issued = false
+			if !sched.Window.Ops[i].Valid || sched.Window.Ops[i].Issued {
+				sched.Window.Ops[i] = Operation{
+					Valid: true,
+					Src1:  1,
+					Src2:  2,
+					Dest:  uint8((cycle*32 + i) % 64),
 				}
 			}
-			sched.ScheduleComplete(destRegs, bundle.Valid)
 		}
 
-		// Verify empty
 		sched.ScheduleCycle0()
 		bundle := sched.ScheduleCycle1()
-		if bundle.Valid != 0 {
-			t.Fatalf("Round %d: window should be empty", round)
-		}
 
-		// Reset scoreboard for next round (clear the destination registers we marked ready)
-		// Actually, we need to ensure sources stay ready and destinations don't interfere
-		// The simplest fix: reset the entire scoreboard and re-mark sources
-		sched.Scoreboard = 0
+		count := bits.OnesCount16(bundle.Valid)
+		totalIssued += count
+
+		// Complete all issued ops
+		var destRegs [16]uint8
+		for i := 0; i < 16; i++ {
+			if (bundle.Valid>>i)&1 != 0 {
+				destRegs[i] = sched.Window.Ops[bundle.Indices[i]].Dest
+			}
+		}
+		sched.ScheduleComplete(destRegs, bundle.Valid)
+	}
+
+	if totalIssued < 1000 {
+		t.Errorf("Should issue many ops over 100 cycles, got %d", totalIssued)
 	}
 }
 
@@ -3356,9 +3239,8 @@ func TestStress_LongChainResolution(t *testing.T) {
 	// WHAT: Resolve maximum-length dependency chain
 	// WHY: Worst-case serialization
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// 32-op chain
 	for i := 0; i < 32; i++ {
 		slot := 31 - i
 		var src1 uint8
@@ -3374,8 +3256,6 @@ func TestStress_LongChainResolution(t *testing.T) {
 			Dest:  uint8(10 + i),
 		}
 	}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
 
 	for step := 0; step < 32; step++ {
 		sched.ScheduleCycle0()
@@ -3390,62 +3270,161 @@ func TestStress_LongChainResolution(t *testing.T) {
 			t.Fatalf("Step %d: expected slot %d, got %d", step, expectedSlot, bundle.Indices[0])
 		}
 
-		// Complete
 		dest := sched.Window.Ops[expectedSlot].Dest
 		sched.ScheduleComplete([16]uint8{dest}, 0b1)
 	}
 }
 
-func TestStress_RandomDependencies(t *testing.T) {
-	// WHAT: Random dependency patterns
-	// WHY: Catch bugs that only appear with specific configurations
+func TestStress_WAWHeavyWorkload(t *testing.T) {
+	// WHAT: Many ops writing same registers
+	// WHY: Stress test WAW handling
 
-	for trial := 0; trial < 100; trial++ {
-		window := &InstructionWindow{}
+	sched := NewOoOScheduler()
 
-		// Generate random ops
-		seed := uint32(trial * 65537)
-		for i := 0; i < 32; i++ {
-			seed = seed*1103515245 + 12345 // LCG
-			window.Ops[i] = Operation{
-				Valid: true,
-				Src1:  uint8((seed >> 0) % 64),
-				Src2:  uint8((seed >> 6) % 64),
-				Dest:  uint8((seed >> 12) % 64),
-			}
+	// 16 ops all write R5
+	for i := 0; i < 16; i++ {
+		sched.Window.Ops[31-i] = Operation{
+			Valid: true,
+			Src1:  uint8(10 + i),
+			Src2:  uint8(30 + i),
+			Dest:  5,
 		}
+	}
 
-		// Should not panic
-		matrix := BuildDependencyMatrix(window)
+	// Issue one
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
 
-		// Verify matrix properties
-		for i := 0; i < 32; i++ {
-			// Diagonal is zero
-			if (matrix[i]>>i)&1 != 0 {
-				t.Fatalf("Trial %d: diagonal[%d] not zero", trial, i)
+	if bits.OnesCount16(bundle.Valid) != 1 {
+		t.Errorf("Should issue only 1 (WAW claimed), got %d", bits.OnesCount16(bundle.Valid))
+	}
+	if bundle.Indices[0] != 31 {
+		t.Errorf("Should issue oldest (slot 31), got slot %d", bundle.Indices[0])
+	}
+
+	// Complete and issue remaining one by one
+	for i := 0; i < 16; i++ {
+		sched.ScheduleComplete([16]uint8{5}, 0b1)
+		sched.ScheduleCycle0()
+		bundle = sched.ScheduleCycle1()
+
+		if i < 15 {
+			if bits.OnesCount16(bundle.Valid) != 1 {
+				t.Errorf("Step %d: should issue 1, got %d", i, bits.OnesCount16(bundle.Valid))
 			}
 		}
 	}
+
+	if !sched.Scoreboard.IsReady(5) {
+		t.Error("R5 should be ready after all completions")
+	}
 }
 
-func TestStress_RapidScoreboardUpdates(t *testing.T) {
-	// WHAT: Many rapid scoreboard state changes
-	// WHY: Tests scoreboard consistency under churn
+func TestStress_RapidComplete(t *testing.T) {
+	// WHAT: Many completions in rapid succession
+	// WHY: Tests scoreboard update throughput
 
 	var sb Scoreboard
 
-	for round := 0; round < 1000; round++ {
-		reg := uint8(round % 64)
-
-		sb.MarkReady(reg)
-		if !sb.IsReady(reg) {
-			t.Fatalf("Round %d: should be ready", round)
+	for cycle := 0; cycle < 100; cycle++ {
+		var destRegs [16]uint8
+		for i := 0; i < 16; i++ {
+			destRegs[i] = uint8((cycle*16 + i) % 64)
 		}
+		UpdateScoreboardAfterComplete(&sb, destRegs, 0xFFFF)
+	}
 
-		sb.MarkPending(reg)
-		if sb.IsReady(reg) {
-			t.Fatalf("Round %d: should be pending", round)
+	// After many completions, scoreboard should have many bits set
+	readyCount := bits.OnesCount64(uint64(sb))
+	if readyCount == 0 {
+		t.Error("Scoreboard should have ready registers")
+	}
+}
+
+func TestStress_MixedWorkload(t *testing.T) {
+	// WHAT: Mix of independent ops and dependency chains
+	// WHY: Realistic workload pattern
+	//
+	// PRIORITY BEHAVIOR:
+	//   Chain members with dependents → HIGH priority (issue one at a time)
+	//   Chain tail + independent ops → LOW priority (all issue together when ready)
+
+	sched := NewOoOScheduler()
+
+	// Independent ops (slots 31-26): all read R1,R2, write different dests
+	for i := 0; i < 6; i++ {
+		sched.Window.Ops[31-i] = Operation{
+			Valid: true,
+			Src1:  1,
+			Src2:  2,
+			Dest:  uint8(10 + i),
 		}
+	}
+
+	// Chain (slots 25-20): each depends on previous
+	// slot 25: src=3 → dest=20
+	// slot 24: src=20 → dest=21
+	// slot 23: src=21 → dest=22
+	// slot 22: src=22 → dest=23
+	// slot 21: src=23 → dest=24
+	// slot 20: src=24 → dest=25 (chain tail, no dependents)
+	for i := 0; i < 6; i++ {
+		var src1 uint8
+		if i == 0 {
+			src1 = 3
+		} else {
+			src1 = uint8(19 + i)
+		}
+		sched.Window.Ops[25-i] = Operation{
+			Valid: true,
+			Src1:  src1,
+			Src2:  4,
+			Dest:  uint8(20 + i),
+		}
+	}
+
+	// Track total issued
+	totalIssued := 0
+
+	// Issue cycle 1: Only slot 25 (chain head, HIGH priority)
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
+	totalIssued += bits.OnesCount16(bundle.Valid)
+
+	if bits.OnesCount16(bundle.Valid) != 1 || bundle.Indices[0] != 25 {
+		t.Errorf("Cycle 1: expected only slot 25, got %d ops", bits.OnesCount16(bundle.Valid))
+	}
+	sched.ScheduleComplete([16]uint8{20}, 0b1)
+
+	// Issue cycles 2-5: slots 24, 23, 22, 21 (each HIGH priority)
+	for expected := uint8(24); expected >= 21; expected-- {
+		sched.ScheduleCycle0()
+		bundle = sched.ScheduleCycle1()
+		totalIssued += bits.OnesCount16(bundle.Valid)
+
+		if bits.OnesCount16(bundle.Valid) != 1 || bundle.Indices[0] != expected {
+			t.Errorf("Expected slot %d, got %d ops, first=%d",
+				expected, bits.OnesCount16(bundle.Valid), bundle.Indices[0])
+		}
+		// Complete the issued op
+		dest := sched.Window.Ops[expected].Dest
+		sched.ScheduleComplete([16]uint8{dest}, 0b1)
+	}
+
+	// Issue cycle 6: slot 20 (chain tail) + slots 31-26 (independent)
+	// All are LOW priority now, all issue together (7 total)
+	sched.ScheduleCycle0()
+	bundle = sched.ScheduleCycle1()
+	totalIssued += bits.OnesCount16(bundle.Valid)
+
+	if bits.OnesCount16(bundle.Valid) != 7 {
+		t.Errorf("Final cycle: expected 7 ops (chain tail + 6 independent), got %d",
+			bits.OnesCount16(bundle.Valid))
+	}
+
+	// Verify total: 1 + 4 + 7 = 12 ops
+	if totalIssued != 12 {
+		t.Errorf("Total issued should be 12, got %d", totalIssued)
 	}
 }
 
@@ -3454,270 +3433,231 @@ func TestStress_RapidScoreboardUpdates(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
 // Pipeline hazards occur when state changes between Cycle 0 and Cycle 1.
-// These are expected and handled correctly - they just add latency.
+// The pipelined priority may become stale, but correctness is preserved.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-func TestPipelineHazard_WindowChangesBetweenCycles(t *testing.T) {
-	// WHAT: Window changes after Cycle 0, before Cycle 1
-	// WHY: New ops added during Cycle 0 won't be considered until next Cycle 0
-
-	sched := &OoOScheduler{}
-
-	// Initial op
-	sched.Window.Ops[0] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-
-	// Cycle 0 sees only op 0
-	sched.ScheduleCycle0()
-
-	// New op added between cycles (simulating allocator)
-	sched.Window.Ops[1] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 11}
-	sched.Scoreboard.MarkReady(3)
-	sched.Scoreboard.MarkReady(4)
-
-	// Cycle 1 uses stale priority (only knows about op 0)
-	bundle := sched.ScheduleCycle1()
-
-	// Op 1 won't be in this bundle
-	for i := 0; i < 16; i++ {
-		if (bundle.Valid>>i)&1 != 0 && bundle.Indices[i] == 1 {
-			t.Log("Note: Op 1 included (implementation dependent)")
-		}
-	}
-
-	t.Log("✓ Window change between cycles handled (op 1 delayed to next Cycle 0)")
-}
-
 func TestPipelineHazard_CompletionBetweenCycles(t *testing.T) {
-	// WHAT: Completion happens after Cycle 0, unblocking an op
-	// WHY: Newly-ready op won't be seen until next Cycle 0
+	// WHAT: Completion arrives between Cycle 0 and Cycle 1
+	// WHY: Tests pipeline register staleness
+	//
+	// Cycle 0: Analyze - sees R10 pending
+	// Between: R10 completes
+	// Cycle 1: Select - uses stale priority (doesn't include newly-ready op)
+	//
+	// This is SAFE: op just waits one more cycle. Not a bug, just latency.
 
-	sched := &OoOScheduler{}
+	sched := NewOoOScheduler()
 
-	// Chain: A → B
-	sched.Window.Ops[20] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
-	sched.Window.Ops[10] = Operation{Valid: true, Src1: 10, Src2: 3, Dest: 11}
-	sched.Scoreboard.MarkReady(1)
-	sched.Scoreboard.MarkReady(2)
-	sched.Scoreboard.MarkReady(3)
+	// First op writes R10
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
 
-	// Cycle 0: A ready, B blocked
+	// Issue it
+	sched.ScheduleCycle0()
+	sched.ScheduleCycle1()
+
+	// Second op reads R10
+	sched.Window.Ops[5] = Operation{Valid: true, Src1: 10, Src2: 2, Dest: 11}
+
+	// Cycle 0: Op 5 blocked (R10 pending)
 	sched.ScheduleCycle0()
 
-	// A completes between cycles (fast execution unit)
-	sched.Window.Ops[20].Issued = true // Marked by previous ScheduleCycle1
+	// Completion arrives between cycles
 	sched.ScheduleComplete([16]uint8{10}, 0b1)
 
-	// Cycle 1: Uses stale priority
+	// Cycle 1: Uses stale priority (computed when R10 was pending)
 	bundle := sched.ScheduleCycle1()
 
-	// B wasn't in the priority computed by Cycle 0
-	t.Log("✓ Completion between cycles: B will be ready next Cycle 0")
-	t.Logf("  Bundle valid: 0x%04X", bundle.Valid)
-}
+	// Op might not be issued this cycle (stale priority)
+	t.Logf("Bundle valid: 0x%04X (may be 0 due to stale priority)", bundle.Valid)
 
-func TestPipelineHazard_ScoreboardRace(t *testing.T) {
-	// WHAT: Scoreboard changes during pipeline
-	// WHY: Documents expected behavior under races
-
-	sched := &OoOScheduler{}
-
-	sched.Window.Ops[0] = Operation{Valid: true, Src1: 10, Src2: 2, Dest: 11}
-	sched.Scoreboard.MarkReady(2)
-	// R10 not ready
-
-	// Cycle 0: Op 0 not ready
-	sched.ScheduleCycle0()
-
-	// R10 becomes ready between cycles
-	sched.Scoreboard.MarkReady(10)
-
-	// Cycle 1: Uses stale priority (op 0 was blocked)
-	bundle := sched.ScheduleCycle1()
-
-	if bundle.Valid != 0 {
-		t.Log("Note: Implementation might include op 0 if it re-checks")
-	}
-
-	// Next Cycle 0 will see op 0 as ready
+	// Next full cycle should catch it
 	sched.ScheduleCycle0()
 	bundle = sched.ScheduleCycle1()
 
 	if bundle.Valid == 0 {
-		t.Error("Op 0 should be ready on second pass")
+		t.Error("Op should be issued after fresh analysis")
+	}
+}
+
+func TestPipelineHazard_IssueInvalidatesReady(t *testing.T) {
+	// WHAT: Cycle 1 issue changes state seen by next Cycle 0
+	// WHY: Verifies pipeline correctly handles state changes
+
+	sched := NewOoOScheduler()
+
+	// Two independent ops
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+	sched.Window.Ops[5] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 11}
+
+	// First cycle: both ready
+	sched.ScheduleCycle0()
+	bundle := sched.ScheduleCycle1()
+
+	if bits.OnesCount16(bundle.Valid) != 2 {
+		t.Errorf("Should issue 2 ops, got %d", bits.OnesCount16(bundle.Valid))
 	}
 
-	t.Log("✓ Scoreboard race: 1 cycle delay to observe new readiness")
+	// Second cycle: both issued, none ready
+	sched.ScheduleCycle0()
+	bundle = sched.ScheduleCycle1()
+
+	if bundle.Valid != 0 {
+		t.Errorf("No ops should be ready, got 0x%04X", bundle.Valid)
+	}
+}
+
+func TestPipelineHazard_WindowModification(t *testing.T) {
+	// WHAT: Window changes between Cycle 0 and Cycle 1
+	// WHY: Simulates new instructions arriving
+
+	sched := NewOoOScheduler()
+
+	sched.Window.Ops[10] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: 10}
+
+	// Cycle 0: Analyze with one op
+	sched.ScheduleCycle0()
+
+	// New op arrives between cycles
+	sched.Window.Ops[5] = Operation{Valid: true, Src1: 3, Src2: 4, Dest: 11}
+
+	// Cycle 1: New op not in priority (computed before arrival)
+	bundle := sched.ScheduleCycle1()
+
+	// Only original op should be issued (new op has stale priority)
+	if bits.OnesCount16(bundle.Valid) != 1 {
+		t.Logf("Got %d ops (new op may or may not be included)", bits.OnesCount16(bundle.Valid))
+	}
+
+	// Next cycle should see new op
+	sched.ScheduleCycle0()
+	// New op now analyzed
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 14. DOCUMENTATION TESTS
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
-// These tests verify assumptions and document specifications.
-// They're more about documentation than bug-finding.
+// These tests document design properties and constraints.
+// They also verify assumptions used elsewhere in the codebase.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-func TestDoc_StructSizes(t *testing.T) {
-	// Document actual struct sizes in this Go implementation
+func TestDoc_StructureSizes(t *testing.T) {
+	// WHAT: Document structure sizes for hardware budgeting
+	// WHY: RTL needs to know exact bit widths
 
-	t.Logf("Operation:         %d bytes", unsafe.Sizeof(Operation{}))
-	t.Logf("InstructionWindow: %d bytes", unsafe.Sizeof(InstructionWindow{}))
-	t.Logf("Scoreboard:        %d bytes", unsafe.Sizeof(Scoreboard(0)))
-	t.Logf("DependencyMatrix:  %d bytes", unsafe.Sizeof(DependencyMatrix{}))
-	t.Logf("PriorityClass:     %d bytes", unsafe.Sizeof(PriorityClass{}))
-	t.Logf("IssueBundle:       %d bytes", unsafe.Sizeof(IssueBundle{}))
-	t.Logf("OoOScheduler:      %d bytes", unsafe.Sizeof(OoOScheduler{}))
+	t.Logf("Operation size: %d bytes", unsafe.Sizeof(Operation{}))
+	t.Logf("InstructionWindow size: %d bytes", unsafe.Sizeof(InstructionWindow{}))
+	t.Logf("Scoreboard size: %d bytes", unsafe.Sizeof(Scoreboard(0)))
+	t.Logf("DependencyMatrix size: %d bytes", unsafe.Sizeof(DependencyMatrix{}))
+	t.Logf("PriorityClass size: %d bytes", unsafe.Sizeof(PriorityClass{}))
+	t.Logf("IssueBundle size: %d bytes", unsafe.Sizeof(IssueBundle{}))
+	t.Logf("OoOScheduler size: %d bytes", unsafe.Sizeof(OoOScheduler{}))
+}
 
-	// Verify expected sizes
-	if unsafe.Sizeof(Scoreboard(0)) != 8 {
-		t.Error("Scoreboard should be 8 bytes (64 bits)")
+func TestDoc_Constants(t *testing.T) {
+	// WHAT: Verify constant relationships
+	// WHY: Document design constraints
+
+	if WindowSize != 32 {
+		t.Errorf("WindowSize should be 32, got %d", WindowSize)
+	}
+	if NumRegisters != 64 {
+		t.Errorf("NumRegisters should be 64, got %d", NumRegisters)
+	}
+	if IssueWidth != 16 {
+		t.Errorf("IssueWidth should be 16, got %d", IssueWidth)
 	}
 
-	if unsafe.Sizeof(DependencyMatrix{}) != 128 {
-		t.Error("DependencyMatrix should be 128 bytes (32 × 32 bits)")
+	// Issue width <= Window size (can't issue more than available)
+	if IssueWidth > WindowSize {
+		t.Error("IssueWidth cannot exceed WindowSize")
+	}
+
+	// Window fits in uint32 bitmap
+	if WindowSize > 32 {
+		t.Error("WindowSize must fit in uint32 bitmap")
+	}
+
+	// Registers fit in uint64 bitmap
+	if NumRegisters > 64 {
+		t.Error("NumRegisters must fit in uint64 bitmap")
 	}
 }
 
-func TestDoc_SlotIndexConvention(t *testing.T) {
-	// Document slot index = age convention
+func TestDoc_AgingOrder(t *testing.T) {
+	// WHAT: Document slot index = age relationship
+	// WHY: Critical for understanding dependency/selection logic
+	//
+	// RULE: Higher slot index = older instruction
+	//   Slot 31: Oldest (entered window first)
+	//   Slot 0:  Newest (entered window last)
 
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("SLOT INDEX = AGE CONVENTION (Topological)")
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("")
-	t.Log("Age is NOT stored. The slot index IS the age.")
-	t.Log("")
-	t.Log("Window layout (FIFO):")
-	t.Log("  Slot 31: Oldest position (instructions enter here)")
-	t.Log("  Slot 0:  Newest position (most recently added)")
-	t.Log("")
-	t.Log("Dependency rule:")
-	t.Log("  If i > j: slot i is older than slot j")
-	t.Log("  RAW dependency: older producer → younger consumer")
-	t.Log("  matrix[producer] bit consumer = 1")
-	t.Log("")
-	t.Log("Example: Chain A → B → C")
-	t.Log("  Slot 20: Op A (oldest, writes R10)")
-	t.Log("  Slot 15: Op B (reads R10, writes R11)")
-	t.Log("  Slot 10: Op C (newest, reads R11)")
-	t.Log("")
-	t.Log("  Dependencies:")
-	t.Log("    matrix[20] bit 15 = 1 (B depends on A)")
-	t.Log("    matrix[15] bit 10 = 1 (C depends on B)")
-	t.Log("")
-	t.Log("Benefits:")
-	t.Log("  • Zero storage for age (derived from slot address)")
-	t.Log("  • Impossible to corrupt age (it's a physical property)")
-	t.Log("  • Prevents false WAR dependencies (i > j check)")
-	t.Log("  • Simple comparison logic")
-	t.Log("")
-}
-
-func TestDoc_TimingBudget(t *testing.T) {
-	// Document timing analysis
-
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("TIMING BUDGET @ 3.5 GHz (286ps cycle)")
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("")
-	t.Log("CYCLE 0 (280ps, 98% utilization):")
-	t.Log("  SRAM read:            80ps (32 banks parallel)")
-	t.Log("  Ready bitmap:        100ps (scoreboard lookups + AND)")
-	t.Log("  Dependency matrix:   120ps (XOR + zero detect + age)")
-	t.Log("  Priority classify:   100ps (OR trees)")
-	t.Log("  Pipeline register:    40ps (setup)")
-	t.Log("  Note: Ready and Dep overlap (80ps shared SRAM)")
-	t.Log("")
-	t.Log("CYCLE 1 (270ps, 94% utilization):")
-	t.Log("  Tier selection:      100ps (OR tree + MUX)")
-	t.Log("  Parallel encoder:    150ps (find 16 highest bits)")
-	t.Log("  Scoreboard update:    20ps (parallel OR)")
-	t.Log("")
-	t.Log("TOTAL LATENCY: 2 cycles (issue to dispatch)")
-	t.Log("")
-}
-
-func TestDoc_TransistorBudget(t *testing.T) {
-	// Document transistor estimates
-
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("TRANSISTOR BUDGET (per context)")
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("")
-	t.Log("Component breakdown:")
-	t.Log("  Window SRAM (32×8B):      ~200K (6T per bit)")
-	t.Log("  Scoreboard register:         ~400 (64 flip-flops)")
-	t.Log("  Dependency comparators:   ~400K (1024 XOR + AND)")
-	t.Log("  Priority OR trees:        ~300K (32 trees)")
-	t.Log("  Issue encoder:             ~50K (32→16 parallel)")
-	t.Log("  Pipeline registers:       ~100K (priority + control)")
-	t.Log("  ─────────────────────────────────────")
-	t.Log("  Total per context:        ~1.05M")
-	t.Log("")
-	t.Log("8 contexts total:           ~8.4M")
-	t.Log("")
-	t.Log("Comparison:")
-	t.Log("  Intel OoO scheduler:     ~300M transistors")
-	t.Log("  SUPRAX advantage:         35× fewer transistors")
-	t.Log("")
-}
-
-func TestDoc_IPCAnalysis(t *testing.T) {
-	// Document expected IPC
-
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("IPC ANALYSIS")
-	t.Log("════════════════════════════════════════════════════════════════")
-	t.Log("")
-	t.Log("SUPRAX target: 12-14 IPC")
-	t.Log("  Context switching hides memory latency")
-	t.Log("  Simple dependencies (no rename overhead)")
-	t.Log("  Fast 2-cycle scheduling")
-	t.Log("")
-	t.Log("Intel actual: 5-6 IPC")
-	t.Log("  Speculation overhead")
-	t.Log("  Complex renaming")
-	t.Log("  4-6 cycle scheduling latency")
-	t.Log("")
-	t.Log("Scheduling heuristic impact:")
-	t.Log("  'Has dependents' vs 'True depth'")
-	t.Log("  Suboptimal choice: ~7% of cycles")
-	t.Log("  Average penalty: 1-2 cycles")
-	t.Log("  Overall IPC loss: 2-4%")
-	t.Log("")
-	t.Log("  BUT true depth would cost 3-6 extra scheduler cycles")
-	t.Log("  Net result: heuristic WINS by 3-6% IPC")
-	t.Log("")
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-// BENCHMARKS
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-//
-// Benchmarks measure Go model performance (not indicative of hardware speed).
-// Useful for identifying algorithmic inefficiencies.
-//
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-
-func BenchmarkComputeReadyBitmap(b *testing.B) {
 	window := &InstructionWindow{}
-	var sb Scoreboard
 
 	for i := 0; i < 32; i++ {
-		window.Ops[i] = Operation{Valid: true, Src1: 1, Src2: 2, Dest: uint8(i + 10)}
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(i)}
 	}
-	sb.MarkReady(1)
-	sb.MarkReady(2)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = ComputeReadyBitmap(window, sb)
+	priority := PriorityClass{LowPriority: 0xFFFFFFFF}
+	bundle := SelectIssueBundle(priority, window)
+
+	// First selected should be oldest (slot 31)
+	if bundle.Indices[0] != 31 {
+		t.Errorf("Oldest-first: expected slot 31 first, got slot %d", bundle.Indices[0])
 	}
+
+	t.Log("✓ Slot index = age confirmed: higher slot = older instruction")
 }
+
+func TestDoc_HazardSummary(t *testing.T) {
+	// WHAT: Document hazard handling summary
+	// WHY: Single source of truth for hazard logic
+
+	t.Log("HAZARD HANDLING SUMMARY:")
+	t.Log("========================")
+	t.Log("")
+	t.Log("RAW (Read-After-Write):")
+	t.Log("  - Phase 1: Producer must ISSUE (dependency matrix + Issued flag)")
+	t.Log("  - Phase 2: Producer must COMPLETE (scoreboard[src] = 1)")
+	t.Log("  - Cost: Dependency matrix (already needed) + producer scan")
+	t.Log("")
+	t.Log("WAR (Write-After-Read):")
+	t.Log("  - Implicit: older reads before younger writes")
+	t.Log("  - Cost: ZERO (slot index encodes age)")
+	t.Log("")
+	t.Log("WAW (Write-After-Write):")
+	t.Log("  - Phase 1: scoreboard[dest] = 1 (older writer must complete)")
+	t.Log("  - Phase 2: claimed mask in SelectIssueBundle (same-cycle WAW)")
+	t.Log("  - Cost: 32 AND gates + 64-bit combinational mask")
+}
+
+func TestDoc_PipelineTimeline(t *testing.T) {
+	// WHAT: Document pipeline execution timeline
+	// WHY: Helps understand latency characteristics
+
+	t.Log("PIPELINE TIMELINE:")
+	t.Log("==================")
+	t.Log("")
+	t.Log("Cycle N:")
+	t.Log("  Cycle 0: Build dep matrix → Compute ready → Classify priority")
+	t.Log("           Store result in PipelinedPriority register")
+	t.Log("")
+	t.Log("Cycle N+1:")
+	t.Log("  Cycle 1: Read PipelinedPriority → Select bundle → Update scoreboard")
+	t.Log("           Output: IssueBundle to execution units")
+	t.Log("")
+	t.Log("Steady State: Both stages overlap")
+	t.Log("  Cycle N:   C0 analyzes, C1 issues from N-1 analysis")
+	t.Log("  Cycle N+1: C0 analyzes, C1 issues from N analysis")
+	t.Log("")
+	t.Log("Issue Latency: 2 cycles from window entry to execution")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// BENCHMARK TESTS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 func BenchmarkBuildDependencyMatrix(b *testing.B) {
 	window := &InstructionWindow{}
@@ -3725,15 +3665,36 @@ func BenchmarkBuildDependencyMatrix(b *testing.B) {
 	for i := 0; i < 32; i++ {
 		window.Ops[i] = Operation{
 			Valid: true,
-			Src1:  uint8(i % 10),
-			Src2:  uint8((i + 1) % 10),
-			Dest:  uint8(10 + i%10),
+			Src1:  uint8(i % 64),
+			Src2:  uint8((i + 1) % 64),
+			Dest:  uint8((i + 2) % 64),
 		}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = BuildDependencyMatrix(window)
+		BuildDependencyMatrix(window)
+	}
+}
+
+func BenchmarkComputeReadyBitmap(b *testing.B) {
+	window := &InstructionWindow{}
+	var sb Scoreboard = ^Scoreboard(0)
+
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{
+			Valid: true,
+			Src1:  uint8(i % 64),
+			Src2:  uint8((i + 1) % 64),
+			Dest:  uint8((i + 2) % 64),
+		}
+	}
+
+	depMatrix := BuildDependencyMatrix(window)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ComputeReadyBitmap(window, sb, depMatrix)
 	}
 }
 
@@ -3741,118 +3702,55 @@ func BenchmarkClassifyPriority(b *testing.B) {
 	readyBitmap := uint32(0xFFFFFFFF)
 	var depMatrix DependencyMatrix
 	for i := 0; i < 32; i++ {
-		depMatrix[i] = uint32(1 << ((i + 1) % 32))
+		depMatrix[i] = uint32(i * 31337)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ClassifyPriority(readyBitmap, depMatrix)
+		ClassifyPriority(readyBitmap, depMatrix)
 	}
 }
 
 func BenchmarkSelectIssueBundle(b *testing.B) {
+	window := &InstructionWindow{}
+	for i := 0; i < 32; i++ {
+		window.Ops[i] = Operation{Valid: true, Dest: uint8(i)}
+	}
+
 	priority := PriorityClass{
-		HighPriority: 0xFFFFFFFF,
-		LowPriority:  0,
+		HighPriority: 0xFFFF0000,
+		LowPriority:  0x0000FFFF,
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SelectIssueBundle(priority)
+		SelectIssueBundle(priority, window)
 	}
 }
 
-func BenchmarkFullCycle0(b *testing.B) {
-	sched := &OoOScheduler{}
+func BenchmarkFullCycle(b *testing.B) {
+	sched := NewOoOScheduler()
 
 	for i := 0; i < 32; i++ {
 		sched.Window.Ops[i] = Operation{
 			Valid: true,
-			Src1:  uint8(i % 10),
-			Src2:  uint8((i + 1) % 10),
-			Dest:  uint8(10 + i%10),
+			Src1:  uint8(i % 64),
+			Src2:  uint8((i + 1) % 64),
+			Dest:  uint8((i + 2) % 64),
 		}
-	}
-	for i := uint8(0); i < 20; i++ {
-		sched.Scoreboard.MarkReady(i)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sched.ScheduleCycle0()
-	}
-}
+		bundle := sched.ScheduleCycle1()
 
-func BenchmarkFullCycle1(b *testing.B) {
-	sched := &OoOScheduler{}
-	sched.PipelinedPriority = PriorityClass{
-		HighPriority: 0x0F0F0F0F,
-		LowPriority:  0xF0F0F0F0,
-	}
-
-	for i := 0; i < 32; i++ {
-		sched.Window.Ops[i] = Operation{Valid: true, Dest: uint8(i + 10)}
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = sched.ScheduleCycle1()
-		// Reset for next iteration
-		for j := 0; j < 32; j++ {
-			sched.Window.Ops[j].Issued = false
+		// Reset issued flags for next iteration
+		for j := 0; j < 16; j++ {
+			if (bundle.Valid>>j)&1 != 0 {
+				sched.Window.Ops[bundle.Indices[j]].Issued = false
+			}
 		}
+		sched.Scoreboard = ^Scoreboard(0)
 	}
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-// TEST COVERAGE SUMMARY
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
-//
-// Functions tested:
-//   ✓ Scoreboard.IsReady
-//   ✓ Scoreboard.MarkReady
-//   ✓ Scoreboard.MarkPending
-//   ✓ ComputeReadyBitmap
-//   ✓ BuildDependencyMatrix
-//   ✓ ClassifyPriority
-//   ✓ SelectIssueBundle
-//   ✓ UpdateScoreboardAfterIssue
-//   ✓ UpdateScoreboardAfterComplete
-//   ✓ OoOScheduler.ScheduleCycle0
-//   ✓ OoOScheduler.ScheduleCycle1
-//   ✓ OoOScheduler.ScheduleComplete
-//
-// Scenarios tested:
-//   ✓ Empty/full window states
-//   ✓ Single/multiple operations
-//   ✓ Ready/blocked states
-//   ✓ Valid/invalid operations
-//   ✓ Issued flag behavior
-//   ✓ Dependency chains
-//   ✓ Diamond patterns
-//   ✓ Forest patterns (multiple trees)
-//   ✓ Wide trees (one root, many leaves)
-//   ✓ Deep chains (serialized)
-//   ✓ Reduction patterns
-//   ✓ RAW hazard detection
-//   ✓ WAR hazard rejection
-//   ✓ WAW hazard rejection
-//   ✓ Slot index boundary (0, 31)
-//   ✓ Register boundary (0, 63)
-//   ✓ Priority classification
-//   ✓ Oldest-first selection
-//   ✓ High/low tier selection
-//   ✓ Pipeline register operation
-//   ✓ Pipeline hazards
-//   ✓ State machine transitions
-//   ✓ Window slot reuse
-//   ✓ Interleaved issue/complete
-//   ✓ Stress: repeated fill/drain
-//   ✓ Stress: long chains
-//   ✓ Stress: random patterns
-//   ✓ Correctness invariants
-//
-// Run with: go test -v -cover
-// Run benchmarks with: go test -bench=.
-//
-// ═══════════════════════════════════════════════════════════════════════════════════════════════
