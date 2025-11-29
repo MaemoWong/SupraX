@@ -199,12 +199,12 @@ func TestConstants_TableConfiguration(t *testing.T) {
 		t.Errorf("EntriesPerTable should be 1024, got %d", EntriesPerTable)
 	}
 
-	if IndexBits != 10 {
-		t.Errorf("IndexBits should be 10 (log2(1024)), got %d", IndexBits)
+	if IndexWidth != 10 {
+		t.Errorf("IndexWidth should be 10 (log2(1024)), got %d", IndexWidth)
 	}
 
 	// Log storage calculation
-	entryBits := TagBits + CounterBits + ContextBits + 1 + 1 + AgeBits
+	entryBits := TagWidth + CounterWidth + ContextWidth + 1 + 1 + AgeWidth
 	tableBits := EntriesPerTable * entryBits
 	totalBits := NumTables * tableBits
 
@@ -246,8 +246,8 @@ func TestConstants_ContextConfiguration(t *testing.T) {
 		t.Errorf("NumContexts should be 8 (3-bit context ID), got %d", NumContexts)
 	}
 
-	if ContextBits != 3 {
-		t.Errorf("ContextBits should be 3, got %d", ContextBits)
+	if ContextWidth != 3 {
+		t.Errorf("ContextWidth should be 3, got %d", ContextWidth)
 	}
 
 	t.Log("Context isolation: 8 contexts (3-bit ID)")

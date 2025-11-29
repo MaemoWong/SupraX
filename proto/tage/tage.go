@@ -146,6 +146,55 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
+// BIT-WIDTH CONSTANTS (SystemVerilog Translation Reference)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// These constants define exact bit widths for all signals.
+// Direct mapping to SystemVerilog:
+//
+//   Go:            const PCWidth = 64
+//   SystemVerilog: parameter PC_WIDTH = 64;
+//                  logic [PC_WIDTH-1:0] pc;
+//
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+const (
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Input Signal Widths
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	PCWidth      = 64 // Program counter width (full address)
+	HistoryWidth = 64 // Global history register width (max history length)
+
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Entry Field Widths
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	TagWidth     = 13 // Partial PC tag for collision detection
+	CounterWidth = 3  // Saturating confidence counter (0-7)
+	ContextWidth = 3  // Hardware context ID (8 contexts)
+	AgeWidth     = 3  // LRU age for replacement (0-7)
+	UsefulWidth  = 1  // Entry usefulness flag
+	TakenWidth   = 1  // Branch direction flag
+
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Derived Entry Width
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Total SRAM word: Tag + Counter + Context + Useful + Taken + Age
+	EntryWidth = TagWidth + CounterWidth + ContextWidth + UsefulWidth + TakenWidth + AgeWidth // 24 bits
+
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Table Addressing Widths
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	IndexWidth      = 10 // Table index width (1024 entries)
+	TableIndexWidth = 3  // Table selector width (8 tables)
+	HitBitmapWidth  = 8  // Hit bitmap for CLZ (one bit per table)
+
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Confidence Output Width
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	ConfidenceWidth = 2 // Confidence level (0=low, 1=medium, 2=high)
+)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
@@ -161,33 +210,30 @@ const (
 	// Hardware: Wired constants affecting SRAM sizing and address decoding
 	// ───────────────────────────────────────────────────────────────────────────────────────
 
-	NumTables       = 8    // Power-of-2 enables CLZ-based selection (3-bit table index)
-	EntriesPerTable = 1024 // 2^10 entries per table (10-bit index)
-	IndexBits       = 10   // log2(EntriesPerTable), used for hash masking
+	NumTables       = 1 << TableIndexWidth // 8 tables (2^3)
+	EntriesPerTable = 1 << IndexWidth      // 1024 entries per table (2^10)
 
 	// ───────────────────────────────────────────────────────────────────────────────────────
-	// Entry Field Widths
+	// Derived Constants (computed from bit widths)
 	// ───────────────────────────────────────────────────────────────────────────────────────
-	// Hardware: Determines SRAM word width and comparison logic
-	// Total entry size: 13 + 3 + 3 + 1 + 1 + 3 = 24 bits
-	// ───────────────────────────────────────────────────────────────────────────────────────
-
-	TagBits     = 13 // Partial PC for collision detection (1/8192 collision rate)
-	CounterBits = 3  // Saturating confidence counter (0-7)
-	ContextBits = 3  // Hardware context ID for Spectre v2 isolation (8 contexts)
-	AgeBits     = 3  // LRU age for replacement (0-7, higher = older)
-
-	// ───────────────────────────────────────────────────────────────────────────────────────
-	// Derived Constants
-	// ───────────────────────────────────────────────────────────────────────────────────────
-	// Hardware: Computed from field widths, used in saturation and bounds checking
+	// Hardware: Used in saturation logic and bounds checking
 	// ───────────────────────────────────────────────────────────────────────────────────────
 
-	NumContexts    = 1 << ContextBits       // 8 contexts (2^3)
-	MaxAge         = (1 << AgeBits) - 1     // 7 (maximum age before saturation)
-	MaxCounter     = (1 << CounterBits) - 1 // 7 (maximum counter value)
-	NeutralCounter = 1 << (CounterBits - 1) // 4 (50/50 starting point)
-	TakenThreshold = 1 << (CounterBits - 1) // 4 (counter >= 4 predicts taken)
+	NumContexts    = 1 << ContextWidth       // 8 contexts (2^3)
+	MaxAge         = (1 << AgeWidth) - 1     // 7 (2^3 - 1)
+	MaxCounter     = (1 << CounterWidth) - 1 // 7 (2^3 - 1)
+	NeutralCounter = 1 << (CounterWidth - 1) // 4 (2^2, midpoint)
+	TakenThreshold = 1 << (CounterWidth - 1) // 4 (counter >= 4 predicts taken)
+
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Mask Constants (for bit extraction)
+	// ───────────────────────────────────────────────────────────────────────────────────────
+	// Hardware: AND gate arrays for field extraction
+	// ───────────────────────────────────────────────────────────────────────────────────────
+
+	IndexMask   = (1 << IndexWidth) - 1   // 0x3FF (10 bits)
+	TagMask     = (1 << TagWidth) - 1     // 0x1FFF (13 bits)
+	ContextMask = (1 << ContextWidth) - 1 // 0x7 (3 bits)
 
 	// ───────────────────────────────────────────────────────────────────────────────────────
 	// Maintenance Parameters
@@ -195,7 +241,7 @@ const (
 	// Hardware: Affects background aging FSM and replacement search width
 	// ───────────────────────────────────────────────────────────────────────────────────────
 
-	AgingInterval    = 1024                 // Branches between global aging (matches table size)
+	AgingInterval    = EntriesPerTable      // 1024 branches between global aging
 	LRUSearchWidth   = 4                    // 4-way associative replacement search
 	ValidBitmapWords = EntriesPerTable / 32 // 32 words × 32 bits = 1024 valid bits
 )
@@ -238,29 +284,31 @@ var HistoryLengths = [NumTables]int{0, 4, 8, 12, 16, 24, 32, 64}
 // HOW:  Packed SRAM word with all fields needed for prediction and replacement
 // WHY:  Compact storage minimizes SRAM area while enabling full functionality
 //
-// Hardware bit layout (24 bits total):
-// ┌──────────┬───────────┬───────────┬────────┬───────┬─────────┐
-// │ Tag[12:0]│Counter[2:0]│Context[2:0]│Useful[0]│Taken[0]│Age[2:0]│
-// │  13 bits │   3 bits  │   3 bits  │  1 bit │ 1 bit │ 3 bits │
-// └──────────┴───────────┴───────────┴────────┴───────┴─────────┘
+// Hardware bit layout (EntryWidth = 24 bits total):
+// ┌────────────────┬─────────────────┬─────────────────┬────────────┬───────────┬─────────────┐
+// │ Tag[12:0]      │ Counter[2:0]    │ Context[2:0]    │ Useful[0]  │ Taken[0]  │ Age[2:0]    │
+// │ TagWidth=13    │ CounterWidth=3  │ ContextWidth=3  │ 1 bit      │ 1 bit     │ AgeWidth=3  │
+// └────────────────┴─────────────────┴─────────────────┴────────────┴───────────┴─────────────┘
 //
-// Field purposes:
+// SystemVerilog equivalent:
 //
-//	Tag:     Partial PC for aliasing detection (Tables 1-7 only)
-//	Counter: Saturating confidence, threshold at 4 for taken prediction
-//	Context: Hardware thread/domain ID for Spectre v2 isolation (Tables 1-7 only)
-//	Useful:  Set when entry provides correct prediction (replacement hint)
-//	Taken:   Last observed branch direction (updated on every access)
-//	Age:     LRU approximation (0 = recently used, 7 = replacement candidate)
+//	typedef struct packed {
+//	    logic [TAG_WIDTH-1:0]     tag;      // [23:11]
+//	    logic [COUNTER_WIDTH-1:0] counter;  // [10:8]
+//	    logic [CONTEXT_WIDTH-1:0] context;  // [7:5]
+//	    logic                     useful;   // [4]
+//	    logic                     taken;    // [3]
+//	    logic [AGE_WIDTH-1:0]     age;      // [2:0]
+//	} tage_entry_t;
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 type TAGEEntry struct {
-	Tag     uint16 // [12:0] Partial PC for collision detection
-	Counter uint8  // [2:0]  Saturating confidence 0-7
-	Context uint8  // [2:0]  Hardware context ID (Spectre v2 isolation)
-	Useful  bool   // [0]    Entry contributed correct prediction
-	Taken   bool   // [0]    Last observed branch direction
-	Age     uint8  // [2:0]  LRU age for replacement
+	Tag     uint16 // [TagWidth-1:0]     Partial PC for collision detection
+	Counter uint8  // [CounterWidth-1:0] Saturating confidence 0-7
+	Context uint8  // [ContextWidth-1:0] Hardware context ID (Spectre v2 isolation)
+	Useful  bool   // [0]                Entry contributed correct prediction
+	Taken   bool   // [0]                Last observed branch direction
+	Age     uint8  // [AgeWidth-1:0]     LRU age for replacement
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -272,20 +320,21 @@ type TAGEEntry struct {
 // WHY:  Each table captures patterns at a specific history depth
 //
 // Hardware structure:
-//   - Entries: 1024 × 24 bits = 3 KB SRAM (single-port, 1 read OR 1 write per cycle)
-//   - ValidBits: 1024 bits = 128 bytes (separate for fast invalidation)
+//   - Entries: EntriesPerTable × EntryWidth bits = 1024 × 24 = 24,576 bits SRAM
+//   - ValidBits: EntriesPerTable bits = 1024 bits (separate flip-flops)
 //   - HistoryLen: Wired constant (not stored, affects hash unit)
 //
-// Table 0 special case:
-//   - Always fully valid (base predictor)
-//   - No tag/context matching
-//   - Provides guaranteed fallback
+// SystemVerilog equivalent:
+//
+//	tage_entry_t entries [0:ENTRIES_PER_TABLE-1];  // SRAM
+//	logic [ENTRIES_PER_TABLE-1:0] valid_bits;      // Flip-flops
+//	parameter HISTORY_LEN = <wired constant>;
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 type TAGETable struct {
-	Entries    [EntriesPerTable]TAGEEntry // 1024 tagged entries (SRAM)
-	ValidBits  [ValidBitmapWords]uint32   // 1024-bit validity bitmap (flip-flops)
-	HistoryLen int                        // History bits used (wired constant)
+	Entries    [EntriesPerTable]TAGEEntry // SRAM array
+	ValidBits  [ValidBitmapWords]uint32   // Valid bitmap (flip-flops)
+	HistoryLen int                        // Wired constant per table
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -298,15 +347,21 @@ type TAGETable struct {
 //
 // Hardware storage:
 //
-//	8 tables × 3.1 KB:     ~25 KB SRAM
-//	8 history registers:   64 bytes (512 bits of flip-flops)
-//	Aging state:           16 bytes
-//	Total:                 ~25 KB
+//	Tables:   NumTables × (EntriesPerTable × EntryWidth) = 8 × 24,576 = ~25 KB SRAM
+//	History:  NumContexts × HistoryWidth = 8 × 64 = 512 bits flip-flops
+//	Aging:    64-bit counter + 1-bit enable = 65 bits flip-flops
+//
+// SystemVerilog equivalent:
+//
+//	tage_table_t tables [0:NUM_TABLES-1];
+//	logic [HISTORY_WIDTH-1:0] history [0:NUM_CONTEXTS-1];
+//	logic [63:0] branch_count;
+//	logic aging_enabled;
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 type TAGEPredictor struct {
 	Tables       [NumTables]TAGETable // 8 prediction tables
-	History      [NumContexts]uint64  // Per-context 64-bit global history registers
+	History      [NumContexts]uint64  // Per-context global history registers
 	BranchCount  uint64               // Aging trigger counter
 	AgingEnabled bool                 // Enable background LRU aging
 }
@@ -324,22 +379,16 @@ type TAGEPredictor struct {
 // WHY:  Guarantees Predict() never returns uninitialized data
 //
 // Hardware reset sequence:
-//  1. Base table (Table 0): All 1024 entries valid, Counter = 4
+//  1. Base table (Table 0): All entries valid, Counter = NeutralCounter
 //  2. History tables (Tables 1-7): All valid bits cleared
 //  3. History registers: All zeros
 //  4. Branch counter: Zero
 //
-// Timing: ~256 cycles for sequential initialization
-//
-//	(could be 1 cycle with parallel ROM initialization)
+// Timing: ~256 cycles sequential, or 1 cycle with parallel ROM/clear
 //
 // CRITICAL INVARIANT:
 //
-//	Base predictor MUST have all 1024 entries valid at all times.
-//	This guarantees a prediction for ANY branch, including:
-//	  - Never-seen branches
-//	  - Branches whose history entries were evicted
-//	  - Branches in newly-switched contexts
+//	Base predictor MUST have all EntriesPerTable entries valid at all times.
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 func NewTAGEPredictor() *TAGEPredictor {
@@ -358,26 +407,23 @@ func NewTAGEPredictor() *TAGEPredictor {
 	// Initialize Base Predictor (Table 0)
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	//
-	// CRITICAL: Every entry must be valid for guaranteed fallback.
-	//
-	// Hardware: Could be ROM-initialized or parallel flip-flop set
-	// Timing:   256 cycles sequential, or 1 cycle parallel
+	// Hardware: ROM initialization or parallel flip-flop preset
+	// Timing:   1 cycle with parallel initialization
 	//
 	baseTable := &pred.Tables[0]
 	for idx := 0; idx < EntriesPerTable; idx++ {
 		baseTable.Entries[idx] = TAGEEntry{
-			Tag:     0,              // Not used for Table 0 (no tag matching)
-			Counter: NeutralCounter, // 4 = neutral, predicts taken initially
-			Context: 0,              // Not used for Table 0 (no context matching)
+			Tag:     0,              // Not used for Table 0
+			Counter: NeutralCounter, // Midpoint (4)
+			Context: 0,              // Not used for Table 0
 			Useful:  false,
-			Taken:   true, // Match counter's initial prediction
+			Taken:   true, // Matches counter prediction
 			Age:     0,
 		}
 
-		// Mark entry valid in bitmap
-		// Hardware: wordIdx = idx[9:5], bitIdx = idx[4:0]
+		// Mark valid: wordIdx = idx[IndexWidth-1:5], bitIdx = idx[4:0]
 		wordIdx := idx >> 5
-		bitIdx := uint(idx & 0x1F)
+		bitIdx := uint(idx & 31)
 		baseTable.ValidBits[wordIdx] |= 1 << bitIdx
 	}
 
@@ -385,8 +431,8 @@ func NewTAGEPredictor() *TAGEPredictor {
 	// Clear History Tables (Tables 1-7)
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	//
-	// Start empty - entries allocated on demand as branches execute.
-	// Hardware: Single-cycle parallel clear of valid bitmap flip-flops
+	// Hardware: Parallel clear of valid bitmap flip-flops
+	// Timing:   1 cycle
 	//
 	for t := 1; t < NumTables; t++ {
 		for w := 0; w < ValidBitmapWords; w++ {
@@ -398,7 +444,8 @@ func NewTAGEPredictor() *TAGEPredictor {
 	// Clear Per-Context History Registers
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	//
-	// Hardware: 8 parallel 64-bit register clears
+	// Hardware: NumContexts parallel 64-bit register clears
+	// Timing:   1 cycle
 	//
 	for ctx := 0; ctx < NumContexts; ctx++ {
 		pred.History[ctx] = 0
@@ -417,112 +464,89 @@ func NewTAGEPredictor() *TAGEPredictor {
 // hashIndex: Compute Table Index from PC and History
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
-// WHAT: Map (PC, history) tuple to 10-bit table index
+// WHAT: Map (PC, history) tuple to IndexWidth-bit table index
 // HOW:  XOR-fold history, combine with PC bits
 // WHY:  Spread entries across table, minimize aliasing
 //
 // Algorithm:
-//  1. Extract PC[21:12] (10 bits, skip low bits that are often 0)
+//  1. Extract PC[21:12] (IndexWidth bits)
 //  2. Mask history to historyLen bits
-//  3. Fold history into 10 bits via repeated XOR
+//  3. Fold history into IndexWidth bits via repeated XOR
 //  4. XOR PC bits with folded history
 //
-// Hardware implementation:
-//   - PC extraction: Barrel shifter + AND mask (40ps)
+// Hardware:
+//   - PC extraction: Barrel shifter + AND with IndexMask (40ps)
 //   - History masking: AND gate array (20ps)
-//   - History folding: Multi-level XOR tree (60ps worst case for 64 bits)
-//   - Final XOR: 10-bit parallel XOR (20ps)
-//   - Total: 80ps (operations overlap)
+//   - History folding: Multi-level XOR tree (60ps worst case)
+//   - Final XOR: IndexWidth-bit parallel XOR (20ps)
 //
-// Why XOR (not ADD or concatenate)?
-//   - ADD: Carry propagation adds latency
-//   - Concatenate: Would need larger tables
-//   - XOR: Zero-latency parallel operation, good bit mixing
+// Timing: 80ps total (operations overlap)
 //
-// Why PC[21:12] (not PC[11:2])?
-//   - PC[1:0] = 0 (instruction alignment)
-//   - PC[4:2] = low entropy (instruction size dependent)
-//   - PC[21:12] captures function and basic block identity
+// SystemVerilog:
+//
+//	function logic [INDEX_WIDTH-1:0] hash_index(
+//	    input logic [PC_WIDTH-1:0] pc,
+//	    input logic [HISTORY_WIDTH-1:0] history,
+//	    input int history_len
+//	);
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
 //go:inline
 func hashIndex(pc uint64, history uint64, historyLen int) uint32 {
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Extract PC[21:12] for 10-bit base index
-	// Hardware: Barrel shifter (12 positions) + AND mask
-	// Timing:   40ps
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	pcBits := uint32((pc >> 12) & 0x3FF)
+	// Extract PC[21:12] for IndexWidth-bit base index
+	// Hardware: pc >> 12, then AND with IndexMask
+	pcBits := uint32((pc >> 12) & IndexMask)
 
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Base predictor (Table 0): No history contribution
-	// Hardware: historyLen=0 is wired, this path is a direct wire
-	// ═══════════════════════════════════════════════════════════════════════════════════════
+	// Base predictor (historyLen=0): No history contribution
 	if historyLen == 0 {
 		return pcBits
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Mask history to relevant bits
-	// Hardware: AND gate array with historyLen-bit mask
-	// Timing:   20ps
-	// ═══════════════════════════════════════════════════════════════════════════════════════
+	// Mask history to historyLen bits
+	// Hardware: AND with (1 << historyLen) - 1
 	mask := uint64((1 << historyLen) - 1)
 	h := history & mask
 
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Fold history into 10 bits using repeated XOR
-	// Hardware: Multi-level XOR tree
-	//   historyLen ≤ 10: 1 level (direct)
-	//   historyLen ≤ 20: 2 levels
-	//   historyLen ≤ 40: 3 levels
-	//   historyLen = 64: 3 levels
-	// Timing:   20ps per level, 60ps worst case
-	//
-	// Note: Symmetric patterns may fold to 0 (e.g., 0x3FF XOR 0x3FF = 0)
-	//       This is mathematically correct; real histories are not symmetric.
-	// ═══════════════════════════════════════════════════════════════════════════════════════
+	// Fold history into IndexWidth bits using repeated XOR
+	// Hardware: Multi-level XOR tree (ceil(historyLen/IndexWidth) levels)
 	histBits := uint32(h)
-	for histBits > 0x3FF {
-		histBits = (histBits & 0x3FF) ^ (histBits >> 10)
+	for histBits > IndexMask {
+		histBits = (histBits & IndexMask) ^ (histBits >> IndexWidth)
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════════════════
 	// Combine PC and folded history
-	// Hardware: 10-bit parallel XOR array
-	// Timing:   20ps
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	return (pcBits ^ histBits) & 0x3FF
+	// Hardware: IndexWidth-bit parallel XOR
+	return (pcBits ^ histBits) & IndexMask
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // hashTag: Extract Partial PC Tag for Collision Detection
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
-// WHAT: Extract 13-bit tag from PC for entry matching
+// WHAT: Extract TagWidth-bit tag from PC
 // HOW:  Barrel shift + AND mask
-// WHY:  Detect when different branches hash to same index (aliasing)
+// WHY:  Detect aliasing (different branches at same index)
 //
 // Tag vs Index independence:
-//   - Tag uses PC[34:22] (13 bits)
-//   - Index uses PC[21:12] (10 bits)
+//   - Tag uses PC[34:22] (TagWidth bits)
+//   - Index uses PC[21:12] (IndexWidth bits)
 //   - No overlap ensures statistical independence
-//   - Combined collision rate: 1/8192 × 1/1024 = 1/8M
 //
-// Why 13 bits (not 8 or 16)?
-//   - 8 bits: 1/256 collision rate - too high, accuracy loss
-//   - 13 bits: 1/8192 collision rate - acceptable
-//   - 16 bits: 1/65536 - diminishing returns, costs 3 more bits per entry
+// Hardware: Barrel shifter (22 positions) + AND with TagMask
+// Timing:   60ps
 //
-// Hardware: Barrel shifter (22 positions) + AND mask
-// Timing:   60ps (shift: 50ps, mask: 10ps)
+// SystemVerilog:
+//
+//	function logic [TAG_WIDTH-1:0] hash_tag(input logic [PC_WIDTH-1:0] pc);
+//	    return pc[22 +: TAG_WIDTH];
+//	endfunction
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
 //go:inline
 func hashTag(pc uint64) uint16 {
-	return uint16((pc >> 22) & 0x1FFF)
+	return uint16((pc >> 22) & TagMask)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -535,38 +559,31 @@ func hashTag(pc uint64) uint16 {
 //
 // WHAT: Predict branch direction using longest-matching history table
 // HOW:  Parallel table lookup + XOR compare + CLZ selection + base fallback
-// WHY:  Longest matching history provides most specific (accurate) prediction
+// WHY:  Longest matching history provides most specific prediction
 //
-// Algorithm:
-//  1. Compute tag from PC (parallel with step 2)
-//  2. For Tables 1-7 in parallel:
-//     a. Compute index = hash(PC, history, historyLen)
-//     b. Check valid bit (early rejection, saves power)
-//     c. Read entry from SRAM
-//     d. XOR-compare tag + context
-//     e. Record hit in bitmap if match
-//  3. CLZ on hit bitmap finds longest-history match
-//  4. If any hit, use winner's prediction (counter >= threshold)
-//  5. If no hit, use base predictor (Table 0)
+// Inputs:
 //
-// Returns:
+//	pc:  [PCWidth-1:0]      Program counter of branch instruction
+//	ctx: [ContextWidth-1:0] Hardware context ID
 //
-//	taken:     Predicted branch direction (true = taken)
-//	confidence: 0 = low (base fallback), 1 = medium, 2 = high (saturated counter)
+// Outputs:
 //
-// Hardware timing breakdown (310ps total):
+//	taken:      [0]                   Predicted direction (1=taken)
+//	confidence: [ConfidenceWidth-1:0] 0=low, 1=medium, 2=high
 //
-//	Stage 1: Hash computation       80ps (8 parallel hash units)
-//	Stage 2: SRAM read             100ps (8 parallel bank reads)
-//	Stage 3: Tag+Context compare   100ps (7 parallel XOR + zero detect)
-//	Stage 4: Hit bitmap + CLZ       50ps (OR tree + priority encoder)
-//	Stage 5: MUX select winner      20ps (8:1 multiplexer)
+// Hardware timing (310ps total):
+//
+//	Stage 1: Hash computation       80ps  (NumTables parallel hash units)
+//	Stage 2: SRAM read             100ps  (NumTables parallel bank reads)
+//	Stage 3: Tag+Context compare   100ps  (NumTables-1 parallel XOR)
+//	Stage 4: Hit bitmap + CLZ       50ps  (OR tree + priority encoder)
+//	Stage 5: MUX select             20ps  (NumTables:1 multiplexer)
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 func (p *TAGEPredictor) Predict(pc uint64, ctx uint8) (taken bool, confidence uint8) {
 	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Input validation
-	// Hardware: Context bits [2:0] extracted, higher bits ignored (AND mask)
+	// Input bounds check
+	// Hardware: ctx & ContextMask (AND gate array)
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	if ctx >= NumContexts {
 		ctx = 0
@@ -576,71 +593,42 @@ func (p *TAGEPredictor) Predict(pc uint64, ctx uint8) (taken bool, confidence ui
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	// STAGE 1: Hash Computation (80ps)
-	// Hardware: Tag computation runs in parallel with first index hash
+	// Hardware: Tag hash runs parallel with index hashes
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	tag := hashTag(pc)
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// STAGES 2-3: Parallel Table Lookup (Tables 1-7)
-	// Hardware: 7 identical lookup units operating simultaneously
-	//           Each unit: Hash → Valid check → SRAM read → Compare → Hit signal
-	//
-	// CRITICAL: Start at table 1, NOT table 0.
-	//           Table 0 is base predictor with NO tag/context matching.
-	//           Including Table 0 would cause false matches (Tag=0, Context=0).
+	// STAGES 2-3: Parallel Table Lookup (Tables 1 to NumTables-1)
+	// Hardware: NumTables-1 identical lookup units
 	// ═══════════════════════════════════════════════════════════════════════════════════════
-	var hitBitmap uint8
-	var predictions [NumTables]bool
-	var counters [NumTables]uint8
+	var hitBitmap uint8             // [HitBitmapWidth-1:0]
+	var predictions [NumTables]bool // [NumTables-1:0]
+	var counters [NumTables]uint8   // [NumTables-1:0][CounterWidth-1:0]
 
 	for i := 1; i < NumTables; i++ {
 		table := &p.Tables[i]
 
-		// Index computation (80ps, parallel for all tables)
+		// Index computation
 		idx := hashIndex(pc, history, table.HistoryLen)
 
-		// Valid bit check (20ps, early rejection saves SRAM power)
-		// Hardware: Single bit extraction from bitmap
+		// Valid bit check (early rejection)
+		// Hardware: valid_bits[idx] single bit extraction
 		wordIdx := idx >> 5
 		bitIdx := idx & 31
 		if (table.ValidBits[wordIdx]>>bitIdx)&1 == 0 {
 			continue
 		}
 
-		// SRAM read (100ps)
+		// SRAM read
 		entry := &table.Entries[idx]
 
-		// ───────────────────────────────────────────────────────────────────────────────
-		// XOR-Based Tag + Context Comparison
-		// ───────────────────────────────────────────────────────────────────────────────
-		//
-		// WHAT: Check if entry matches both tag AND context
-		// HOW:  XOR both fields, OR results, check if zero
-		// WHY:  Combined check faster than separate comparisons
-		//
-		// Mathematical proof:
-		//   (A ^ B) == 0 ⟺ A == B           (XOR property)
-		//   (X | Y) == 0 ⟺ X == 0 AND Y == 0 (OR property)
-		//   Therefore: match ⟺ (tag matches) AND (context matches)
-		//
-		// Hardware timing (100ps):
-		//   XOR tag (13 bits):    20ps
-		//   XOR context (3 bits): 20ps (parallel with tag)
-		//   OR combine (16 bits): 20ps
-		//   Zero detect (NOR):    40ps
-		//
-		// SPECTRE V2 PROTECTION:
-		//   Context check ensures attacker in context A cannot
-		//   influence predictions for victim in context B.
-		//   Mismatch → entry not used → no cross-context influence.
-		// ───────────────────────────────────────────────────────────────────────────────
+		// XOR-based tag + context comparison
+		// Hardware: (entry.Tag ^ tag) | (entry.Context ^ ctx) == 0
 		xorTag := entry.Tag ^ tag
 		xorCtx := uint16(entry.Context ^ ctx)
-		xorCombined := xorTag | xorCtx
 
-		if xorCombined == 0 {
+		if (xorTag | xorCtx) == 0 {
 			hitBitmap |= 1 << uint(i)
-			// Use counter threshold for prediction (consistent with base predictor)
 			predictions[i] = entry.Counter >= TakenThreshold
 			counters[i] = entry.Counter
 		}
@@ -648,60 +636,31 @@ func (p *TAGEPredictor) Predict(pc uint64, ctx uint8) (taken bool, confidence ui
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	// STAGE 4: Winner Selection via CLZ (50ps)
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	//
-	// WHAT: Find highest-numbered table with a hit
-	// HOW:  CLZ (Count Leading Zeros) on hit bitmap
-	// WHY:  Higher table number = longer history = more specific pattern
-	//
-	// Example:
-	//   hitBitmap = 0b00101010 (tables 1, 3, 5 match)
-	//   CLZ = 2 (two leading zeros in 8-bit value)
-	//   winner = 7 - 2 = 5 (table 5, longest matching history)
-	//
-	// Hardware: 8-bit priority encoder (50ps)
+	// Hardware: HitBitmapWidth-bit priority encoder
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	if hitBitmap != 0 {
 		clz := bits.LeadingZeros8(hitBitmap)
 		winner := 7 - clz
 
-		// ───────────────────────────────────────────────────────────────────────────────
-		// Compute confidence from counter value
-		// Hardware: Threshold comparisons (40ps, parallel with CLZ)
-		//
-		// Confidence levels:
-		//   0-1: High confidence NOT taken (counter saturated low)
-		//   2-5: Medium confidence (counter in middle range)
-		//   6-7: High confidence TAKEN (counter saturated high)
-		// ───────────────────────────────────────────────────────────────────────────────
+		// Confidence from counter saturation
+		// Hardware: Parallel threshold comparators
 		counter := counters[winner]
-		if counter <= 1 || counter >= 6 {
+		if counter <= 1 || counter >= (MaxCounter-1) {
 			confidence = 2 // High (saturated)
 		} else {
 			confidence = 1 // Medium
 		}
 
-		// STAGE 5: MUX select winner (20ps)
 		return predictions[winner], confidence
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	// FALLBACK: Base Predictor (Table 0)
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	//
-	// WHAT: Use Table 0 when no history table matches
-	// HOW:  Direct index lookup with NO tag/context check
-	// WHY:  Guaranteed prediction for cold/evicted branches
-	//
-	// Security note:
-	//   Base predictor is shared across contexts but only provides
-	//   statistical bias (taken vs not-taken), not attacker-controlled
-	//   specific predictions. This is safe for Spectre v2.
-	//
+	// Hardware: Direct index lookup, no tag/context check
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	baseIdx := hashIndex(pc, 0, 0)
 	baseEntry := &p.Tables[0].Entries[baseIdx]
-	return baseEntry.Counter >= TakenThreshold, 0 // confidence = 0 (low)
+	return baseEntry.Counter >= TakenThreshold, 0
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -712,33 +671,25 @@ func (p *TAGEPredictor) Predict(pc uint64, ctx uint8) (taken bool, confidence ui
 // Update: Train Predictor with Actual Branch Outcome
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
-// WHAT: Update counters, allocate new entries, shift history
-// HOW:  Update base predictor, find/update history entry or allocate new
-// WHY:  Learn from observed branch behavior to improve future predictions
+// WHAT: Update counters, allocate entries, shift history
+// HOW:  Update base, find/update history entry or allocate, shift history
+// WHY:  Learn from observed branch behavior
 //
-// Algorithm:
-//  1. ALWAYS update base predictor (Table 0) - learns statistical bias
-//  2. Find longest-matching entry in Tables 1-7
-//  3. If found: Update counter, Taken, Useful, Age
-//  4. If not found: Allocate new entry in Table 1
-//  5. Shift history register, insert new outcome
-//  6. Increment branch count, trigger aging if needed
+// Inputs:
+//
+//	pc:    [PCWidth-1:0]      Program counter
+//	ctx:   [ContextWidth-1:0] Hardware context ID
+//	taken: [0]                Actual branch direction
 //
 // Hardware timing (100ps, non-critical path):
 //
-//	Base counter update:     40ps (saturating add/sub)
-//	History entry update:    40ps (saturating add/sub, parallel with base)
-//	History register shift:  40ps (64-bit shift register)
-//	Age reset:               20ps (single field write)
-//
-// Note: Update timing overlaps with next prediction cycle, so not critical.
+//	Base counter:    40ps (saturating add/sub)
+//	History entry:   40ps (saturating add/sub)
+//	History shift:   40ps (HistoryWidth-bit shift register)
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Input validation
-	// Hardware: Context bits [2:0] extracted, higher bits ignored
-	// ═══════════════════════════════════════════════════════════════════════════════════════
+	// Input bounds check
 	if ctx >= NumContexts {
 		ctx = 0
 	}
@@ -748,18 +699,7 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	// ALWAYS Update Base Predictor (Table 0)
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	//
-	// CRITICAL: Base predictor learns from ALL branches, ALL contexts.
-	// This ensures good fallback predictions when no history entry matches.
-	//
-	// No tag/context check - base predictor is purely PC-indexed.
-	// All contexts contribute to same entry, which is fine because:
-	//   - Base predictor only captures statistical bias
-	//   - Not used for context-specific predictions
-	//   - Spectre v2 safe (no specific attacker-controlled predictions)
-	//
-	// Hardware: Saturating 3-bit counter (40ps)
+	// Hardware: Saturating CounterWidth-bit adder/subtractor
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	baseIdx := hashIndex(pc, 0, 0)
 	baseEntry := &p.Tables[0].Entries[baseIdx]
@@ -776,16 +716,8 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 	baseEntry.Taken = taken
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Find Matching Entry in History Tables (Tables 1-7)
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	//
-	// Search from Table 7 down to Table 1 (longest to shortest history).
-	// First match is the longest match.
-	//
-	// Hardware note: In real hardware, this result is cached from Predict().
-	//                Here we recompute for model simplicity.
-	//
-	// CRITICAL: Stop at 1, NOT 0. Table 0 is base predictor.
+	// Find Matching Entry in History Tables
+	// Hardware: Result cached from Predict() in real implementation
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	matchedTable := -1
 	var matchedIdx uint32
@@ -794,7 +726,6 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 		table := &p.Tables[i]
 		idx := hashIndex(pc, history, table.HistoryLen)
 
-		// Check valid bit
 		wordIdx := idx >> 5
 		bitIdx := idx & 31
 		if (table.ValidBits[wordIdx]>>bitIdx)&1 == 0 {
@@ -802,8 +733,6 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 		}
 
 		entry := &table.Entries[idx]
-
-		// Check tag + context match
 		if entry.Tag == tag && entry.Context == ctx {
 			matchedTable = i
 			matchedIdx = idx
@@ -815,18 +744,10 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 	// Update Existing Entry OR Allocate New
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	if matchedTable >= 1 {
-		// ───────────────────────────────────────────────────────────────────────────────
-		// UPDATE EXISTING ENTRY (in Tables 1-7)
-		// ───────────────────────────────────────────────────────────────────────────────
-		//
-		// Entry found - update its state based on actual outcome.
-		//
-		// Hardware: Saturating counter update (40ps read-modify-write)
-		// ───────────────────────────────────────────────────────────────────────────────
+		// Update existing entry
 		table := &p.Tables[matchedTable]
 		entry := &table.Entries[matchedIdx]
 
-		// Saturating counter update
 		if taken {
 			if entry.Counter < MaxCounter {
 				entry.Counter++
@@ -838,58 +759,31 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 		}
 
 		entry.Taken = taken
-		entry.Useful = true // Entry is actively contributing predictions
-		entry.Age = 0       // Reset LRU age (recently accessed)
-
+		entry.Useful = true
+		entry.Age = 0
 	} else {
-		// ───────────────────────────────────────────────────────────────────────────────
-		// ALLOCATE NEW ENTRY (in Table 1)
-		// ───────────────────────────────────────────────────────────────────────────────
-		//
-		// No matching entry found - allocate in Table 1 (shortest history).
-		//
-		// Why Table 1 (not Table 0 or higher)?
-		//   - Table 0: Base predictor, never allocates, always valid
-		//   - Table 1: Shortest history (4 bits), good starting point
-		//   - Tables 2-7: Get entries naturally as longer patterns emerge
-		//
-		// Hardware: 4-way LRU victim selection (60ps)
-		// ───────────────────────────────────────────────────────────────────────────────
+		// Allocate new entry in Table 1
 		allocTable := &p.Tables[1]
 		allocIdx := hashIndex(pc, history, allocTable.HistoryLen)
-
-		// Find victim slot using 4-way LRU search
 		victimIdx := findLRUVictim(allocTable, allocIdx)
 
-		// Write new entry
 		allocTable.Entries[victimIdx] = TAGEEntry{
 			Tag:     tag,
 			Context: ctx,
-			Counter: NeutralCounter, // Start neutral (4)
-			Useful:  false,          // Not yet proven useful
+			Counter: NeutralCounter,
+			Useful:  false,
 			Taken:   taken,
-			Age:     0, // Fresh entry
+			Age:     0,
 		}
 
-		// Mark valid in bitmap
 		wordIdx := victimIdx >> 5
 		bitIdx := victimIdx & 31
 		allocTable.ValidBits[wordIdx] |= 1 << bitIdx
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
-	// Update Per-Context History Register
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	//
-	// WHAT: Shift in new branch outcome
-	// HOW:  Left shift by 1, OR in taken bit at LSB
-	// WHY:  Build history for future predictions
-	//
-	// Hardware: 64-bit shift register with serial input (40ps)
-	//
-	// History register layout:
-	//   Bit 0:  Most recent branch outcome
-	//   Bit 63: 64th most recent branch (oldest, falls off on next shift)
+	// Update History Register
+	// Hardware: HistoryWidth-bit shift register with serial input
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	p.History[ctx] <<= 1
 	if taken {
@@ -898,12 +792,6 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	// Aging Trigger
-	// ═══════════════════════════════════════════════════════════════════════════════════════
-	//
-	// WHAT: Periodically age all entries for LRU replacement
-	// HOW:  Increment counter, trigger AgeAllEntries at threshold
-	// WHY:  Create age gradient so unused entries become replacement candidates
-	//
 	// Hardware: Compare + conditional FSM trigger
 	// ═══════════════════════════════════════════════════════════════════════════════════════
 	if p.BranchCount < ^uint64(0) {
@@ -921,32 +809,17 @@ func (p *TAGEPredictor) Update(pc uint64, ctx uint8, taken bool) {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
-// findLRUVictim: Find Victim Slot for New Entry Allocation
+// findLRUVictim: Find Victim Slot for New Entry
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
 // WHAT: Find best slot to evict near preferredIdx
-// HOW:  Check 4 adjacent slots, prefer free (invalid), then oldest (highest age)
-// WHY:  Local search balances replacement quality vs timing
-//
-// Algorithm:
-//  1. Check slots [preferredIdx, +1, +2, +3] with wraparound
-//  2. If any slot is free (invalid), return immediately (no eviction needed)
-//  3. Otherwise, return slot with highest Age (least recently used)
-//
-// Why 4-way (not fully associative or direct mapped)?
-//   - Fully associative: 1024 comparisons = too slow
-//   - Direct mapped: Always replace preferredIdx = thrashing
-//   - 4-way: Good quality (finds free or old), fast (4 parallel compares)
-//
-// Why prefer free over LRU?
-//   - Free slot = no eviction = no information lost
-//   - Even old valid entries might be useful for rare branches
+// HOW:  Check LRUSearchWidth adjacent slots, prefer free, then oldest
+// WHY:  Local search balances quality vs timing
 //
 // Hardware timing (60ps):
 //
-//	Valid bit check:   20ps (4 parallel bit extractions)
-//	Age comparison:    40ps (4-way max comparator)
-//	Index selection:   20ps (MUX, overlaps with comparison)
+//	Valid check:    20ps (LRUSearchWidth parallel bit extracts)
+//	Age comparison: 40ps (LRUSearchWidth-way max comparator)
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
@@ -956,23 +829,18 @@ func findLRUVictim(table *TAGETable, preferredIdx uint32) uint32 {
 	victimIdx := preferredIdx
 
 	for offset := uint32(0); offset < LRUSearchWidth; offset++ {
-		// Wraparound at table boundary
-		// Hardware: 10-bit adder with wrap (idx + offset) & 0x3FF
+		// Wraparound: (preferredIdx + offset) & IndexMask
 		idx := (preferredIdx + offset) & (EntriesPerTable - 1)
 
-		// Check if slot is free (invalid)
-		// Hardware: Single bit extraction from valid bitmap
 		wordIdx := idx >> 5
 		bitIdx := idx & 31
 
+		// Free slot: return immediately (early termination saves power)
 		if (table.ValidBits[wordIdx]>>bitIdx)&1 == 0 {
-			// Free slot found - return immediately
-			// Hardware: Early termination saves power (no further SRAM reads)
 			return idx
 		}
 
-		// Track oldest (highest age) valid entry
-		// Hardware: 4-way max comparator tree
+		// Track oldest valid entry
 		age := table.Entries[idx].Age
 		if age > maxAge {
 			maxAge = age
@@ -984,57 +852,34 @@ func findLRUVictim(table *TAGETable, preferredIdx uint32) uint32 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// AGING (Background Maintenance)
+// AGING
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
-// AgeAllEntries: Increment Age for All Valid Entries in History Tables
+// AgeAllEntries: Increment Age for All Valid History Entries
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
-// WHAT: Increment Age field of every valid entry (saturating at 7)
-// HOW:  Sequential scan of Tables 1-7, skip invalid entries
+// WHAT: Increment Age field of valid entries in Tables 1 to NumTables-1
+// HOW:  Sequential scan, skip invalid, saturate at MaxAge
 // WHY:  Create age gradient for LRU replacement
 //
-// Scope: Tables 1-7 ONLY. Table 0 (base predictor) is never aged because
+// Scope: Tables 1-7 only. Table 0 (base) never aged.
 //
-//	it doesn't use LRU replacement - all entries are always valid.
+// Hardware timing: (NumTables-1) × EntriesPerTable / 32 = 224 cycles
 //
-// Aging mechanism:
-//   - Triggered every AgingInterval (1024) branches
-//   - All valid entries have Age incremented (saturates at 7)
-//   - Recently accessed entries have Age=0 (reset on update)
-//   - Old entries (Age 5-7) become replacement candidates
-//
-// Why global aging (not per-access)?
-//   - Per-access: Would need to update 7000+ entries per branch (too expensive)
-//   - Global: Increment all entries every 1024 branches (amortized cost)
-//
-// Hardware timing: 224 cycles (background operation)
-//
-//	7 tables × 1024 entries = 7168 entries
-//	Process 32 entries per cycle (one valid bitmap word)
-//	7168 / 32 = 224 cycles
-//
-// Note: This function always ages regardless of AgingEnabled flag.
-//
-//	The flag is checked in Update() before calling this function.
-//	Direct calls will age unconditionally (useful for testing).
+// Note: Always ages regardless of AgingEnabled. Flag checked in Update().
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 func (p *TAGEPredictor) AgeAllEntries() {
-	// Age only Tables 1-7 (history tables)
-	// Table 0 (base predictor) is never aged
 	for t := 1; t < NumTables; t++ {
 		for i := 0; i < EntriesPerTable; i++ {
-			// Check valid bit first (skip invalid, saves power)
 			wordIdx := i >> 5
 			bitIdx := i & 31
+
 			if (p.Tables[t].ValidBits[wordIdx]>>bitIdx)&1 == 0 {
 				continue
 			}
 
-			// Saturating age increment
-			// Hardware: 3-bit saturating adder
 			entry := &p.Tables[t].Entries[i]
 			if entry.Age < MaxAge {
 				entry.Age++
@@ -1051,28 +896,9 @@ func (p *TAGEPredictor) AgeAllEntries() {
 // OnMispredict: Handle Branch Misprediction
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
-// WHAT: Train predictor with correct outcome after misprediction
-// HOW:  Call Update() with actual outcome
-// WHY:  Learn from mistakes to improve future predictions
-//
-// Misprediction response:
-//
-//	Same as correct prediction - update counter, shift history.
-//	Counter update moves prediction toward correct direction.
-//
-// Note: Pipeline flush (discarding speculative work) is handled by
-//
-//	the OoO scheduler. This function only handles predictor training.
-//
-// Alternative strategies (NOT IMPLEMENTED):
-//   - Decrement Useful bits in alternative entries
-//   - Allocate to longer-history table on mispredict
-//   - Reset counter to neutral instead of updating
-//
-// We skip these because:
-//   - Simple update is usually sufficient
-//   - Extra logic adds area and timing pressure
-//   - Marginal accuracy improvement (~0.1%)
+// WHAT: Train predictor with correct outcome
+// HOW:  Call Update() with actual direction
+// WHY:  Learn from mistakes
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
@@ -1089,38 +915,25 @@ func (p *TAGEPredictor) OnMispredict(pc uint64, ctx uint8, actualTaken bool) {
 // Reset: Clear Predictor State (Except Base Table)
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 //
-// WHAT: Invalidate all history table entries, clear history registers
-// HOW:  Clear valid bitmaps for Tables 1-7, zero history registers
-// WHY:  Security (context switch) or testing
+// WHAT: Invalidate history tables, clear history registers
+// HOW:  Clear valid bitmaps and history registers
+// WHY:  Security or testing
 //
 // What's reset:
 //
-//	✓ History tables (Tables 1-7): All entries invalidated
-//	✓ History registers: All zeros
-//	✓ Branch count: Zero
-//	✗ Base table (Table 0): NOT reset (always needs valid entries)
+//	✓ Tables 1 to NumTables-1: Valid bits cleared
+//	✓ History registers: Zeroed
+//	✓ Branch count: Zeroed
+//	✗ Table 0: NOT reset (base predictor must stay valid)
 //
-// Why keep base table?
-//   - Base table provides guaranteed fallback
-//   - If cleared, Predict() could return uninitialized data
-//   - Base table is per-PC only, shared across contexts
-//   - Resetting wouldn't improve security (already context-agnostic)
-//
-// Hardware timing: 1-2 cycles
-//
-//	History registers: 8 parallel writes (1 cycle)
-//	Valid bitmaps: 7 × 32 words = 224 bits, parallel clear (1-2 cycles)
+// Hardware timing: 1-2 cycles (parallel clear)
 //
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 func (p *TAGEPredictor) Reset() {
-	// Clear per-context history registers
-	// Hardware: 8 parallel 64-bit register clears
 	for ctx := 0; ctx < NumContexts; ctx++ {
 		p.History[ctx] = 0
 	}
 
-	// Clear valid bits for history tables (keep base)
-	// Hardware: Parallel clear of valid bitmap flip-flops
 	for t := 1; t < NumTables; t++ {
 		for w := 0; w < ValidBitmapWords; w++ {
 			p.Tables[t].ValidBits[w] = 0
@@ -1131,45 +944,31 @@ func (p *TAGEPredictor) Reset() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// STATISTICS (Debug/Profiling Only)
+// STATISTICS (Debug Only)
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-// ───────────────────────────────────────────────────────────────────────────────────────────────
-// TAGEStats: Predictor Statistics for Debugging
-// ───────────────────────────────────────────────────────────────────────────────────────────────
-//
-// Not part of hardware - used for model validation and analysis.
-//
-// ───────────────────────────────────────────────────────────────────────────────────────────────
+// TAGEStats holds debug statistics (not part of hardware).
 type TAGEStats struct {
-	BranchCount    uint64     // Total branches seen
-	EntriesUsed    [8]uint32  // Valid entries per table
-	AverageAge     [8]float32 // Mean age per table
-	UsefulEntries  [8]uint32  // Entries with Useful=true
-	AverageCounter [8]float32 // Mean counter per table
+	BranchCount    uint64
+	EntriesUsed    [NumTables]uint32
+	AverageAge     [NumTables]float32
+	UsefulEntries  [NumTables]uint32
+	AverageCounter [NumTables]float32
 }
 
-// ───────────────────────────────────────────────────────────────────────────────────────────────
-// Stats: Compute Current Predictor Statistics
-// ───────────────────────────────────────────────────────────────────────────────────────────────
-//
-// Not called in normal operation - for debugging/profiling only.
-// O(n) scan of all entries, do not call in performance-critical paths.
-//
-// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Stats computes predictor statistics (debug only, O(n) scan).
 func (p *TAGEPredictor) Stats() TAGEStats {
 	var stats TAGEStats
 	stats.BranchCount = p.BranchCount
 
 	for t := 0; t < NumTables; t++ {
-		var totalAge uint64
-		var totalCounter uint64
-		var validCount uint32
-		var usefulCount uint32
+		var totalAge, totalCounter uint64
+		var validCount, usefulCount uint32
 
 		for i := 0; i < EntriesPerTable; i++ {
 			wordIdx := i >> 5
 			bitIdx := i & 31
+
 			if (p.Tables[t].ValidBits[wordIdx]>>bitIdx)&1 != 0 {
 				entry := &p.Tables[t].Entries[i]
 				validCount++
@@ -1194,55 +993,39 @@ func (p *TAGEPredictor) Stats() TAGEStats {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// PERFORMANCE SUMMARY
+// SYSTEMVERILOG TRANSLATION REFERENCE
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //
-// TIMING @ 2.9 GHz (345ps cycle):
-// ───────────────────────────────
-//   Predict: 310ps (90% cycle utilization) ✓
-//   Update:  100ps (non-critical path, overlaps with next predict)
+// Module interface:
 //
-// EXPECTED ACCURACY:
-// ─────────────────
-//   Target:     97-98% (8 tables, geometric history)
-//   vs Intel:   96-97% (similar TAGE implementation)
-//   vs 6-table: 96-97% (fewer history depths)
+//   module tage_predictor (
+//       input  logic                      clk,
+//       input  logic                      rst_n,
 //
-// TRANSISTOR BUDGET:
-// ─────────────────
-//   SRAM storage:  ~1.05M (8 tables × 3KB × 6T/bit)
-//   Logic:         ~262K  (hash + compare + CLZ + control)
-//   Total:         ~1.31M
-//   vs Intel:      ~22M   (17× simpler)
+//       // Predict interface
+//       input  logic [PC_WIDTH-1:0]       pred_pc,
+//       input  logic [CONTEXT_WIDTH-1:0]  pred_ctx,
+//       output logic                      pred_taken,
+//       output logic [CONFIDENCE_WIDTH-1:0] pred_confidence,
 //
-// POWER @ 2.9 GHz, 7nm:
-// ─────────────────────
-//   Dynamic: ~17mW (8 SRAM reads per prediction)
-//   Leakage: ~3mW
-//   Total:   ~20mW
-//   vs Intel: ~200mW (10× more efficient)
+//       // Update interface
+//       input  logic                      update_valid,
+//       input  logic [PC_WIDTH-1:0]       update_pc,
+//       input  logic [CONTEXT_WIDTH-1:0]  update_ctx,
+//       input  logic                      update_taken
+//   );
 //
-// SECURITY:
-// ────────
-//   Spectre v2:     Immune (context-tagged entries in Tables 1-7)
-//   Base predictor: Safe (only provides statistical bias, no pattern leakage)
-//   Cross-context:  Isolated (no shared training in history tables)
+// Key parameters (from Go constants):
 //
-// DESIGN DECISIONS SUMMARY:
-// ────────────────────────
-// ┌────────────────────────────┬───────────────────────┬──────────────────────────────┐
-// │ Decision                   │ Alternative           │ Tradeoff                     │
-// ├────────────────────────────┼───────────────────────┼──────────────────────────────┤
-// │ 8 tables                   │ 4 or 16 tables        │ 97% vs 95% or 98% (area)     │
-// │ Geometric history          │ Linear history        │ Better pattern coverage      │
-// │ Context tags (Tables 1-7)  │ No tags               │ Spectre immunity             │
-// │ Base predictor (Table 0)   │ All tables tagged     │ Guaranteed fallback          │
-// │ XOR comparison             │ Subtractor            │ -20ps per comparison         │
-// │ 4-way LRU                  │ Fully associative     │ 60ps vs 200ps                │
-// │ Allocate to Table 1        │ Allocate anywhere     │ Cold start efficiency        │
-// │ Always update base         │ Only on miss          │ Better fallback accuracy     │
-// │ Counter-based prediction   │ Taken field           │ Consistency, hysteresis      │
-// │ Early return in LRU        │ Full scan             │ Power savings                │
-// └────────────────────────────┴───────────────────────┴──────────────────────────────┘
+//   parameter PC_WIDTH       = 64;
+//   parameter HISTORY_WIDTH  = 64;
+//   parameter TAG_WIDTH      = 13;
+//   parameter COUNTER_WIDTH  = 3;
+//   parameter CONTEXT_WIDTH  = 3;
+//   parameter AGE_WIDTH      = 3;
+//   parameter INDEX_WIDTH    = 10;
+//   parameter NUM_TABLES     = 8;
+//   parameter NUM_CONTEXTS   = 8;
+//   parameter ENTRY_WIDTH    = 24;
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
